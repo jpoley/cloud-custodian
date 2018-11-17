@@ -1,4 +1,4 @@
-# Copyright 2016 Capital One Services, LLC
+# Copyright 2015-2018 Capital One Services, LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,104 +11,156 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import absolute_import, division, print_function, unicode_literals
+
 import json
 import logging
 import os
-import StringIO
-import shutil
-import tempfile
-import yaml
+import unittest
+import uuid
+from functools import partial
 
-from c7n import policy
-from c7n.ctx import ExecutionContext
-from c7n.utils import CONN_CACHE
+from c7n.schema import generate
+from c7n.resources import load_resources
+from c7n.config import Bag, Config
 
-from zpill import PillTest
-
-
-logging.getLogger('placebo.pill').setLevel(logging.WARNING)
-logging.getLogger('botocore').setLevel(logging.WARNING)
+from c7n.testing import TestUtils, TextTestIO, functional # NOQA
+from .zpill import PillTest
 
 
-class BaseTest(PillTest):
+logging.getLogger("placebo.pill").setLevel(logging.DEBUG)
+logging.getLogger("botocore").setLevel(logging.WARNING)
 
-    def cleanUp(self):
-        # Clear out thread local session cache        
-        CONN_CACHE.session = None
-        
-    def get_context(self, config=None, session_factory=None, policy=None):
-        if config is None:
-            self.context_output_dir = self.mkdtemp()
-            self.addCleanup(shutil.rmtree, self.context_output_dir)
-            config = Config.empty(output_dir=self.context_output_dir)
-        ctx = ExecutionContext(
-            session_factory,
-            policy or Bag({'name':'test-policy'}),
-            config)
-        return ctx
 
-    def load_policy(self, data, config=None, session_factory=None):
-        config = config or {}
-        temp_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, temp_dir)
-        config['output_dir'] = temp_dir
-        conf = Config.empty(**config)
-        return policy.Policy(data, conf, session_factory)
-    
-    def load_policy_set(self, data, config=None):
-        t = tempfile.NamedTemporaryFile()
-        t.write(yaml.dump(data, Dumper=yaml.SafeDumper))
-        t.flush()
-        self.addCleanup(t.close)
-        if config:
-            e = Config.empty(**config)
-        else:
-            e = Config.empty()
-        return policy.load(e, t.name)
+load_resources()
 
-    def patch(self, obj, attr, new):
-        old = getattr(obj, attr, None)
-        setattr(obj, attr, new)
-        self.addCleanup(setattr, obj, attr, old)
+ACCOUNT_ID = "644160558196"
 
-    def capture_logging(
-            self, name=None, level=logging.INFO, 
-            formatter=None, log_file=None):
-        if log_file is None:
-            log_file = StringIO.StringIO()
-        log_handler = logging.StreamHandler(log_file)
-        if formatter:
-            log_handler.setFormatter(formatter)
-        logger = logging.getLogger(name)
-        logger.addHandler(log_handler)
-        old_logger_level = logger.level
-        logger.setLevel(level)
 
-        @self.addCleanup
-        def reset_logging():
-            logger.removeHandler(log_handler)
-            logger.setLevel(old_logger_level)
+C7N_SCHEMA = generate()
+C7N_VALIDATE = bool(os.environ.get("C7N_VALIDATE", ""))
 
-        return log_file
+skip_if_not_validating = unittest.skipIf(
+    not C7N_VALIDATE, reason="We are not validating schemas."
+)
 
-    
+
+class TestConfig(Config):
+    config_args = {
+        "metrics_enabled": False,
+        "account_id": ACCOUNT_ID,
+        "output_dir": "s3://test-example/foo",
+    }
+
+    empty = staticmethod(partial(Config.empty, **config_args))
+
+
+# Set this so that if we run nose directly the tests will not fail
+if "AWS_DEFAULT_REGION" not in os.environ:
+    os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
+
+
+class BaseTest(TestUtils, PillTest):
+
+    custodian_schema = C7N_SCHEMA
+
+    @property
+    def account_id(self):
+        return ACCOUNT_ID
+
+
+class ConfigTest(BaseTest):
+    """Test base class for integration tests with aws config.
+
+    To allow for integration testing with config.
+
+     - before creating and modifying use the
+       initialize_config_subscriber method to setup an sqs queue on
+       the config recorder's sns topic. returns the sqs queue url.
+
+     - after creating/modifying a resource, use the wait_for_config
+       with the queue url and the resource id.
+    """
+
+    def wait_for_config(self, session, queue_url, resource_id):
+        # lazy import to avoid circular
+        from c7n.sqsexec import MessageIterator
+
+        client = session.client("sqs")
+        messages = MessageIterator(client, queue_url, timeout=20)
+        results = []
+        while True:
+            for m in messages:
+                msg = json.loads(m["Body"])
+                change = json.loads(msg["Message"])
+                messages.ack(m)
+                if change["configurationItem"]["resourceId"] != resource_id:
+                    continue
+                results.append(change["configurationItem"])
+                break
+            if results:
+                break
+        return results
+
+    def initialize_config_subscriber(self, session):
+        config = session.client("config")
+        sqs = session.client("sqs")
+        sns = session.client("sns")
+
+        channels = config.describe_delivery_channels().get("DeliveryChannels", ())
+        assert channels, "config not enabled"
+
+        topic = channels[0]["snsTopicARN"]
+        queue = "custodian-waiter-%s" % str(uuid.uuid4())
+        queue_url = sqs.create_queue(QueueName=queue).get("QueueUrl")
+        self.addCleanup(sqs.delete_queue, QueueUrl=queue_url)
+
+        attrs = sqs.get_queue_attributes(
+            QueueUrl=queue_url, AttributeNames=("Policy", "QueueArn")
+        )
+        queue_arn = attrs["Attributes"]["QueueArn"]
+        policy = json.loads(
+            attrs["Attributes"].get(
+                "Policy",
+                '{"Version":"2008-10-17","Id":"%s/SQSDefaultPolicy","Statement":[]}'
+                % queue_arn,
+            )
+        )
+        policy["Statement"].append(
+            {
+                "Sid": "ConfigTopicSubscribe",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "sqs:SendMessage",
+                "Resource": queue_arn,
+                "Condition": {"ArnEquals": {"aws:SourceArn": topic}},
+            }
+        )
+        sqs.set_queue_attributes(
+            QueueUrl=queue_url, Attributes={"Policy": json.dumps(policy)}
+        )
+        subscription = sns.subscribe(
+            TopicArn=topic, Protocol="sqs", Endpoint=queue_arn
+        ).get(
+            "SubscriptionArn"
+        )
+        self.addCleanup(sns.unsubscribe, SubscriptionArn=subscription)
+        return queue_url
+
+
 def placebo_dir(name):
-    return os.path.join(
-        os.path.dirname(__file__), 'data', 'placebo', name)
+    return os.path.join(os.path.dirname(__file__), "data", "placebo", name)
 
 
-def event_data(name):
-    with open(
-            os.path.join(
-                os.path.dirname(__file__), 'data', 'cwe', name)) as fh:
+def event_data(name, event_type="cwe"):
+    with open(os.path.join(os.path.dirname(__file__), "data", event_type, name)) as fh:
         return json.load(fh)
-        
+
 
 def load_data(file_name, state=None, **kw):
-    data = json.loads(open(
-        os.path.join(
-            os.path.dirname(__file__), 'data',
-            file_name)).read())
+    data = json.loads(
+        open(os.path.join(os.path.dirname(__file__), "data", file_name)).read()
+    )
     if state:
         data.update(state)
     if kw:
@@ -116,42 +168,16 @@ def load_data(file_name, state=None, **kw):
     return data
 
 
-def instance(state=None, **kw):
-    return load_data('ec2-instance.json', state, **kw)
+def instance(state=None, file="ec2-instance.json", **kw):
+    return load_data(file, state, **kw)
 
 
-class Bag(dict):
-        
-    def __getattr__(self, k):
-        try:
-            return self[k]
-        except KeyError:
-            raise AttributeError(k)
-
-        
-class Config(Bag):
-
-    @classmethod
-    def empty(cls, **kw):
-        d = {}
-        d.update({
-            'region': "us-east-1",
-            'cache': '',
-            'profile': None,
-            'assume_role': None,
-            'log_group': None,
-            'metrics_enabled': False,
-            'output_dir': 's3://test-example/foo',
-            'cache_period': 0,
-            'dryrun': False})
-        d.update(kw)
-        return cls(d)
-
-    
-class Instance(Bag): pass
+class Instance(Bag):
+    pass
 
 
-class Reservation(Bag): pass
+class Reservation(Bag):
+    pass
 
 
 class Client(object):
@@ -162,8 +188,4 @@ class Client(object):
 
     def get_all_instances(self, filters=None):
         self.filters = filters
-        return [Reservation(
-            {'instances': [i for i in self.instances]})]
-        
-        
-
+        return [Reservation({"instances": [i for i in self.instances]})]

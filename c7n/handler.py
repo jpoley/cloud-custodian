@@ -1,4 +1,4 @@
-# Copyright 2016 Capital One Services, LLC
+# Copyright 2016-2017 Capital One Services, LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,54 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Cloud-Maid Lambda Entry Point
+Cloud-Custodian Lambda Entry Point
 
 Mostly this serves to load up the policy and dispatch
 an event.
 """
+from __future__ import absolute_import, division, print_function, unicode_literals
 
-from cStringIO import StringIO
-
+import os
+import uuid
 import logging
 import json
 
-from c7n.policy import load
-from c7n.utils import format_event
+from c7n.policy import PolicyCollection
+from c7n.resources import load_resources
+from c7n.utils import format_event, get_account_id_from_sts
+from c7n.config import Config
 
+import boto3
 
 logging.root.setLevel(logging.DEBUG)
 logging.getLogger('botocore').setLevel(logging.WARNING)
 log = logging.getLogger('custodian.lambda')
 
+account_id = None
 
-# TODO move me / we should load config options directly from policy config   
-class Config(dict):
-
-    def __getattr__(self, k):
-        try:
-            return self[k]
-        except KeyError:
-            raise AttributeError(k)
-        
-    @classmethod
-    def empty(cls, **kw):
-        d = {}
-        d.update({
-            'region': "us-east-1",
-            'cache': '',
-            'profile': None,
-            'assume_role': None,
-            'log_group': None,
-            'metrics_enabled': False,
-            'output_dir': '/tmp/',
-            'cache_period': 0,
-            'dryrun': False})
-        d.update(kw)
-        return cls(d)
+# On cold start load all resources, requires a pythonpath directory scan
+if 'AWS_EXECUTION_ENV' in os.environ:
+    load_resources()
 
 
 def dispatch_event(event, context):
-    log.info("Processing event\n %s", format_event(event))
+
+    global account_id
+    if account_id is None:
+        session = boto3.Session()
+        account_id = get_account_id_from_sts(session)
 
     error = event.get('detail', {}).get('errorCode')
     if error:
@@ -67,7 +55,38 @@ def dispatch_event(event, context):
         return
 
     event['debug'] = True
-    policies = load(Config.empty(), 'config.json', format='json')
-    for p in policies:
-        p.push(event, context)
+    if event['debug']:
+        log.info("Processing event\n %s", format_event(event))
 
+    # policies file should always be valid in lambda so do loading naively
+    with open('config.json') as f:
+        policy_config = json.load(f)
+
+    if not policy_config or not policy_config.get('policies'):
+        return False
+
+    # Initialize output directory, we've seen occassional perm issues with
+    # lambda on temp directory and changing unix execution users, so
+    # use a per execution temp space.
+    output_dir = os.environ.get(
+        'C7N_OUTPUT_DIR',
+        '/tmp/' + str(uuid.uuid4()))
+    if not os.path.exists(output_dir):
+        try:
+            os.mkdir(output_dir)
+        except OSError as error:
+            log.warning("Unable to make output directory: {}".format(error))
+
+    # TODO. This enshrines an assumption of a single policy per lambda.
+    options_overrides = policy_config[
+        'policies'][0].get('mode', {}).get('execution-options', {})
+    options_overrides['account_id'] = account_id
+    if 'output_dir' not in options_overrides:
+        options_overrides['output_dir'] = output_dir
+    options = Config.empty(**options_overrides)
+
+    policies = PolicyCollection.from_data(policy_config, options)
+    if policies:
+        for p in policies:
+            p.push(event, context)
+    return True
