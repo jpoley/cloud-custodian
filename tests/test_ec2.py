@@ -18,7 +18,8 @@ import unittest
 import time
 
 from datetime import datetime
-from dateutil import tz, zoneinfo
+from dateutil import tz
+import jmespath
 from mock import mock
 from jsonschema.exceptions import ValidationError
 
@@ -192,6 +193,30 @@ class TestDisableApiTermination(BaseTest):
                 )
             ),
         )
+
+
+class TestSsm(BaseTest):
+
+    def test_ssm_status(self):
+        session_factory = self.replay_flight_data('test_ec2_ssm_filter')
+        policy = self.load_policy({
+            'name': 'ec2-ssm',
+            'resource': 'aws.ec2',
+            'filters': [
+                {'type': 'ssm',
+                 'key': 'PlatformName',
+                 'value': 'Ubuntu'},
+                {'type': 'ssm',
+                 'key': 'PingStatus',
+                 'value': 'Online'}]},
+            session_factory=session_factory,
+            config={'region': 'us-east-2'})
+        resources = policy.run()
+        self.assertEqual(len(resources), 2)
+        self.assertTrue('c7n:SsmState' in resources[0])
+        self.assertEqual(
+            [r['InstanceId'] for r in resources],
+            ['i-0dea82d960d56dc1d', 'i-0ba3874e85bb97244'])
 
 
 class TestHealthEventsFilter(BaseTest):
@@ -646,7 +671,7 @@ class TestTag(BaseTest):
         self.assertEqual(len(resources), 3)
 
     def test_ec2_mark_zero(self):
-        localtz = zoneinfo.gettz("America/New_York")
+        localtz = tz.gettz("America/New_York")
         dt = datetime.now(localtz)
         dt = dt.replace(year=2017, month=11, day=24, hour=7, minute=00)
         session_factory = self.replay_flight_data("test_ec2_mark_zero")
@@ -695,7 +720,7 @@ class TestTag(BaseTest):
         self.assertEqual(result.date(), dt.date())
 
     def test_ec2_mark_hours(self):
-        localtz = zoneinfo.gettz("America/New_York")
+        localtz = tz.gettz("America/New_York")
         dt = datetime.now(localtz)
         dt = dt.replace(
             year=2018, month=2, day=20, hour=18, minute=00, second=0, microsecond=0
@@ -1138,7 +1163,7 @@ class TestModifySecurityGroupsActionSchema(BaseTest):
         }
         self.assertRaises(ValidationError, self.load_policy, policy, validate=True)
 
-    def test_invalid_add_params(self):
+    def test_valid_add_params(self):
         # string invalid
         policy = {
             "name": "add-with-incorrect-param-string",
@@ -1151,7 +1176,7 @@ class TestModifySecurityGroupsActionSchema(BaseTest):
                 },
             ],
         }
-        self.assertRaises(ValidationError, self.load_policy, data=policy, validate=True)
+        self.assertTrue(self.load_policy(data=policy, validate=True))
 
     def test_invalid_isolation_group_params(self):
         policy = {
@@ -1239,12 +1264,7 @@ class TestModifySecurityGroupAction(BaseTest):
         client = session_factory().client("ec2")
 
         default_sg_id = client.describe_security_groups(GroupNames=["default"])[
-            "SecurityGroups"
-        ][
-            0
-        ][
-            "GroupId"
-        ]
+            "SecurityGroups"][0]["GroupId"]
 
         # Catch on anything that uses the *PROD-ONLY* security groups but isn't in a prod role
         policy = self.load_policy(
@@ -1337,8 +1357,35 @@ class TestModifySecurityGroupAction(BaseTest):
 
         first_resources = policy.run()
         self.assertEqual(len(first_resources[0]["NetworkInterfaces"][0]["Groups"]), 1)
+        policy.validate()
         second_resources = policy.run()
         self.assertEqual(len(second_resources[0]["NetworkInterfaces"][0]["Groups"]), 2)
+
+    def test_add_remove_with_name(self):
+        session_factory = self.replay_flight_data(
+            "test_ec2_modify_groups_action_with_name")
+        policy = self.load_policy({
+            "name": "add-remove-sg-with-name",
+            "resource": "ec2",
+            "query": [
+                {'instance-id': "i-094207d64930768dc"}],
+            "actions": [
+                {"type": "modify-security-groups",
+                 "remove": ["launch-wizard-1"],
+                 "add": "launch-wizard-2"}]},
+            session_factory=session_factory, config={'region': 'us-east-2'})
+
+        resources = policy.run()
+        self.assertEqual(len(resources), 1)
+
+        client = session_factory().client('ec2')
+        if self.recording:
+            time.sleep(3)
+        self.assertEqual(
+            jmespath.search(
+                "Reservations[].Instances[].SecurityGroups[].GroupName",
+                client.describe_instances(InstanceIds=["i-094207d64930768dc"])),
+            ["launch-wizard-2"])
 
 
 class TestAutoRecoverAlarmAction(BaseTest):

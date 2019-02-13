@@ -53,14 +53,19 @@ import six
 
 from botocore.client import Config
 from botocore.exceptions import ClientError
-from botocore.vendored.requests.exceptions import SSLError
 
 from collections import defaultdict
 from concurrent.futures import as_completed
 from dateutil.parser import parse as parse_date
+try:
+    from urllib3.exceptions import SSLError
+except ImportError:
+    from botocore.vendored.requests.packages.urllib3.exceptions import SSLError
+
 
 from c7n.actions import (
     ActionRegistry, BaseAction, PutMetric, RemovePolicyBase)
+from c7n.actions.securityhub import PostFinding
 from c7n.exceptions import PolicyValidationError
 from c7n.filters import (
     FilterRegistry, Filter, CrossAccountAccessFilter, MetricsFilter,
@@ -69,7 +74,7 @@ from c7n.manager import resources
 from c7n import query
 from c7n.tags import RemoveTag, Tag, TagActionFilter, TagDelayedAction
 from c7n.utils import (
-    chunks, local_session, set_annotation, type_schema,
+    chunks, local_session, set_annotation, type_schema, filter_empty,
     dumps, format_string_values, get_account_alias_from_sts)
 
 
@@ -453,7 +458,8 @@ def assemble_bucket(item):
         # As soon as we learn location (which generally works)
         if k == 'Location' and v is not None:
             b_location = v.get('LocationConstraint')
-            # Location == region for all cases but EU per https://goo.gl/iXdpnl
+            # Location == region for all cases but EU
+            # https://docs.aws.amazon.com/AmazonS3/latest/API/RESTBucketGETlocation.html
             if b_location is None:
                 b_location = "us-east-1"
             elif b_location == 'EU':
@@ -574,11 +580,14 @@ class S3CrossAccountFilter(CrossAccountAccessFilter):
     def get_accounts(self):
         """add in elb access by default
 
-        ELB Accounts by region http://goo.gl/a8MXxd
+        ELB Accounts by region
+         https://docs.aws.amazon.com/elasticloadbalancing/latest/classic/enable-access-logs.html
 
-        Redshift Accounts by region https://goo.gl/MKWPTT
+        Redshift Accounts by region
+         https://docs.aws.amazon.com/redshift/latest/mgmt/db-auditing.html#rs-db-auditing-cloud-trail-rs-acct-ids
 
-        Cloudtrail Accounts by region https://goo.gl/kWQk9D
+        Cloudtrail Accounts by region
+         https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-supported-regions.html
         """
         accounts = super(S3CrossAccountFilter, self).get_accounts()
         return accounts.union(
@@ -720,6 +729,24 @@ class BucketActionBase(BaseAction):
                                    b['Name'], f.exception())
                 results += filter(None, [f.result()])
             return results
+
+
+@S3.action_registry.register("post-finding")
+class BucketFinding(PostFinding):
+    def format_resource(self, r):
+        owner = r.get("Acl", {}).get("Owner", {})
+        resource = {
+            "Type": "AwsS3Bucket",
+            "Id": "arn:aws:s3:::{}".format(r["Name"]),
+            "Region": get_region(r),
+            "Tags": {t["Key"]: t["Value"] for t in r.get("Tags", [])},
+            "Details": {"AwsS3Bucket": {"OwnerId": owner.get('ID', 'Unknown')}}
+        }
+
+        if "DisplayName" in owner:
+            resource["Details"]["AwsS3Bucket"]["OwnerName"] = owner['DisplayName']
+
+        return filter_empty(resource)
 
 
 @filters.register('has-statement')
@@ -1219,7 +1246,7 @@ class ToggleLogging(BucketActionBase):
 
     Target bucket ACL must allow for WRITE and READ_ACP Permissions
     Not specifying a target_prefix will default to the current bucket name.
-    http://goo.gl/PiWWU2
+    https://docs.aws.amazon.com/AmazonS3/latest/dev/enable-logging-programming.html
 
     :example:
 
@@ -1260,7 +1287,7 @@ class ToggleLogging(BucketActionBase):
 
         for r in resources:
             client = bucket_client(session, r)
-            is_logging = bool(r['Logging'])
+            is_logging = bool(r.get('Logging'))
 
             if enabled and not is_logging:
                 variables = {
@@ -1999,7 +2026,7 @@ class LogTarget(Filter):
     def get_s3_bucket_locations(buckets, self_log=False):
         """return (bucket_name, prefix) for all s3 logging targets"""
         for b in buckets:
-            if b['Logging']:
+            if b.get('Logging'):
                 if self_log:
                     if b['Name'] != b['Logging']['TargetBucket']:
                         continue
@@ -2158,7 +2185,7 @@ class BucketTag(Tag):
                     value: us-east-1
     """
 
-    def process_resource_set(self, resource_set, tags):
+    def process_resource_set(self, client, resource_set, tags):
         modify_bucket_tags(self.manager.session_factory, resource_set, tags)
 
 
@@ -2186,9 +2213,6 @@ class MarkBucketForOp(TagDelayedAction):
     schema = type_schema(
         'mark-for-op', rinherit=TagDelayedAction.schema)
 
-    def process_resource_set(self, resource_set, tags):
-        modify_bucket_tags(self.manager.session_factory, resource_set, tags)
-
 
 @actions.register('unmark')
 class RemoveBucketTag(RemoveTag):
@@ -2211,7 +2235,7 @@ class RemoveBucketTag(RemoveTag):
     schema = type_schema(
         'unmark', aliases=('remove-tag',), tags={'type': 'array'})
 
-    def process_resource_set(self, resource_set, tags):
+    def process_resource_set(self, client, resource_set, tags):
         modify_bucket_tags(
             self.manager.session_factory, resource_set, remove_tags=tags)
 
@@ -2283,6 +2307,7 @@ class Inventory(ValueFilter):
             for f in as_completed(futures):
                 b = futures[f]
                 if f.exception():
+                    b.setdefault('c7n:DeniedMethods', []).append('GetInventoryConfiguration')
                     self.log.error(
                         "Error processing bucket: %s error: %s",
                         b['Name'], f.exception())
@@ -2544,7 +2569,8 @@ class DeleteBucket(ScanBucket):
 class Lifecycle(BucketActionBase):
     """Action applies a lifecycle policy to versioned S3 buckets
 
-    The schema to supply to the rule follows the schema here: goo.gl/yULzNc
+    The schema to supply to the rule follows the schema here:
+     https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3.html#S3.Client.put_bucket_lifecycle_configuration
 
     To delete a lifecycle rule, supply Status=absent
 

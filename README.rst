@@ -2,8 +2,8 @@
      :target: https://gitter.im/capitalone/cloud-custodian?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge
      :alt: Join the chat at https://gitter.im/capitalone/cloud-custodian
 
-.. image:: https://ci.cloudcustodian.io/api/badges/capitalone/cloud-custodian/status.svg
-     :target: https://ci.cloudcustodian.io/capitalone/cloud-custodian
+.. image:: https://dev.azure.com/cloud-custodian/cloud-custodian/_apis/build/status/cloud-custodian.cloud-custodian?branchName=master
+     :target: https://dev.azure.com/cloud-custodian/cloud-custodian/_build
      :alt: Build Status
 
 .. image:: https://img.shields.io/badge/license-Apache%202-blue.svg
@@ -66,9 +66,9 @@ Features
 Links
 #####
 
-- `Homepage <https://developer.capitalone.com/opensource-projects/cloud-custodian>`_
-- `Docs <http://capitalone.github.io/cloud-custodian/docs/>`_
-- `Developer Install <http://capitalone.github.io/cloud-custodian/docs/developer/installing.html>`_
+- `Homepage <http://cloudcustodian.io>`_
+- `Docs <http://cloudcustodian.io/docs/index.html>`_
+- `Developer Install <https://cloudcustodian.io/docs/developer/installing.html>`_
 - `Presentations <https://www.google.com/search?q=cloud+custodian&source=lnms&tbm=vid>`_
 
 Quick Install
@@ -96,7 +96,7 @@ First a policy file needs to be created in YAML format, as an example::
       - encrypt-keys
 
   - name: ec2-require-non-public-and-encrypted-volumes
-    resource: ec2
+    resource: aws.ec2
     description: |
       Provision a lambda and cloud watch event target
       that looks at all new instances and terminates those with
@@ -106,14 +106,14 @@ First a policy file needs to be created in YAML format, as an example::
       events:
           - RunInstances
     filters:
-      - type: aws.ebs
+      - type: ebs
         key: Encrypted
         value: false
     actions:
       - terminate
 
   - name: tag-compliance
-    resource: ec2
+    resource: aws.ec2
     description: |
       Schedule a resource that does not meet tag compliance policies
       to be stopped in four days.

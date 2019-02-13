@@ -14,7 +14,7 @@
 
 from c7n.provider import clouds
 
-from collections import Counter
+from collections import Counter, namedtuple
 import contextlib
 import copy
 import datetime
@@ -30,8 +30,11 @@ import traceback
 
 import boto3
 
+from botocore.validate import ParamValidator
+
 from c7n.credentials import SessionFactory
 from c7n.config import Bag
+from c7n.exceptions import PolicyValidationError
 from c7n.log import CloudWatchLogHandler
 
 # Import output registries aws provider extends.
@@ -115,6 +118,35 @@ def _default_account_id(options):
         options.account_id = utils.get_account_id_from_sts(session)
     except Exception:
         options.account_id = None
+
+
+def shape_validate(params, shape_name, service):
+    session = fake_session()._session
+    model = session.get_service_model(service)
+    shape = model.shape_for(shape_name)
+    validator = ParamValidator()
+    report = validator.validate(params, shape)
+    if report.has_errors():
+        raise PolicyValidationError(report.generate_report())
+
+
+class Arn(namedtuple('_Arn', (
+        'arn', 'partition', 'service', 'region',
+        'account_id', 'resource', 'resource_type'))):
+
+    __slots__ = ()
+
+    @classmethod
+    def parse(cls, arn):
+        parts = arn.split(':', 5)
+        # a few resources use qualifiers without specifying type
+        if parts[2] in ('s3', 'apigateway', 'execute-api'):
+            parts.append(None)
+        elif '/' in parts[-1]:
+            parts.extend(reversed(parts.pop(-1).split('/', 1)))
+        elif ':' in parts[-1]:
+            parts.extend(reversed(parts.pop(-1).split(':', 1)))
+        return cls(*parts)
 
 
 @metrics_outputs.register('aws')
@@ -216,14 +248,14 @@ class XrayTracer(object):
     use_daemon = 'AWS_XRAY_DAEMON_ADDRESS' in os.environ
     service_name = 'custodian'
 
-    context = XrayContext()
-    if HAVE_XRAY:
+    @classmethod
+    def initialize(cls):
+        context = XrayContext()
         xray_recorder.configure(
-            emitter=use_daemon is False and emitter or None,
+            emitter=cls.use_daemon is False and cls.emitter or None,
             context=context,
             sampling=True,
-            context_missing='LOG_ERROR'
-        )
+            context_missing='LOG_ERROR')
         patch(['boto3', 'requests'])
         logging.getLogger('aws_xray_sdk.core').setLevel(logging.ERROR)
 
@@ -297,6 +329,12 @@ class ApiStats(DeltaStats):
     def __exit__(self, exc_type=None, exc_value=None, exc_traceback=None):
         if isinstance(self.ctx.session_factory, credentials.SessionFactory):
             self.ctx.session_factory.set_subscribers(())
+
+        # With cached sessions, we need to unregister any events subscribers
+        # on extant sessions to allow for the next registration.
+        utils.local_session(self.ctx.session_factory).events.unregister(
+            'after-call.*.*', self._record, unique_id='c7n-api-stats')
+
         self.ctx.metrics.put_metric(
             "ApiCalls", sum(self.api_calls.values()), "Count")
         self.pop_snapshot()
@@ -307,8 +345,7 @@ class ApiStats(DeltaStats):
 
     def _record(self, http_response, parsed, model, **kwargs):
         self.api_calls["%s.%s" % (
-            model.service_model.endpoint_prefix,
-            model.name)] += 1
+            model.service_model.endpoint_prefix, model.name)] += 1
 
 
 @blob_outputs.register('s3')
@@ -390,6 +427,9 @@ class AWS(object):
         """
         _default_region(options)
         _default_account_id(options)
+        if options.tracer and options.tracer.startswith('xray') and HAVE_XRAY:
+            XrayTracer.initialize()
+
         return options
 
     def get_session_factory(self, options):
@@ -463,12 +503,18 @@ class AWS(object):
             options)
 
 
-def get_service_region_map(regions, resource_types):
-    # we're not interacting with the apis just using the sdk meta information.
+def fake_session():
     session = boto3.Session(
         region_name='us-east-1',
         aws_access_key_id='never',
         aws_secret_access_key='found')
+    return session
+
+
+def get_service_region_map(regions, resource_types):
+    # we're not interacting with the apis just using the sdk meta information.
+
+    session = fake_session()
     normalized_types = []
     for r in resource_types:
         if r.startswith('aws.'):

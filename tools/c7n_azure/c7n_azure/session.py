@@ -16,14 +16,16 @@ import importlib
 import json
 import logging
 import os
+import types
 
 import jwt
 from azure.common.credentials import (BasicTokenAuthentication,
                                       ServicePrincipalCredentials)
 
+from msrestazure.azure_active_directory import MSIAuthentication
+
 from c7n_azure import constants
-from c7n_azure.constants import RESOURCE_ACTIVE_DIRECTORY
-from c7n_azure.utils import ResourceIdParser, StringUtils
+from c7n_azure.utils import ResourceIdParser, StringUtils, custodian_azure_send_override
 
 try:
     from azure.cli.core._profile import Profile
@@ -34,10 +36,11 @@ except Exception:
 class Session(object):
 
     def __init__(self, subscription_id=None, authorization_file=None,
-                 resource=RESOURCE_ACTIVE_DIRECTORY):
+                 resource=constants.RESOURCE_ACTIVE_DIRECTORY):
         """
         :param subscription_id: If provided overrides environment variables.
-
+        :param authorization_file: Path to file populated from 'get_functions_auth_string'
+        :param resource: Resource endpoint for OAuth token.
         """
 
         self.log = logging.getLogger('custodian.azure.session')
@@ -75,6 +78,10 @@ class Session(object):
             constants.ENV_ACCESS_TOKEN, constants.ENV_SUB_ID
         ]
 
+        msi_auth_variables = [
+            constants.ENV_USE_MSI, constants.ENV_SUB_ID
+        ]
+
         if self.authorization_file:
             self.credentials, self.subscription_id = self.load_auth_file(self.authorization_file)
             self.log.info("Creating session with authorization file")
@@ -100,6 +107,18 @@ class Session(object):
             self.tenant_id = os.environ[constants.ENV_TENANT_ID]
             self.log.info("Creating session with Service Principal Authentication")
 
+        elif all(k in os.environ for k in msi_auth_variables):
+            # MSI authentication
+            if constants.ENV_CLIENT_ID in os.environ:
+                self.credentials = MSIAuthentication(
+                    client_id=os.environ[constants.ENV_CLIENT_ID],
+                    resource=self.resource_namespace)
+            else:
+                self.credentials = MSIAuthentication(
+                    resource=self.resource_namespace)
+
+            self.subscription_id = os.environ[constants.ENV_SUB_ID]
+            self.log.info("Creating session with MSI Authentication")
         else:
             # Azure CLI authentication
             self._is_cli_auth = True
@@ -129,7 +148,17 @@ class Session(object):
         service_name, client_name = client.rsplit('.', 1)
         svc_module = importlib.import_module(service_name)
         klass = getattr(svc_module, client_name)
-        return klass(self.credentials, self.subscription_id)
+        client = klass(self.credentials, self.subscription_id)
+
+        # Override send() method to log request limits & custom retries
+        service_client = client._client
+        service_client.orig_send = service_client.send
+        service_client.send = types.MethodType(custodian_azure_send_override, service_client)
+
+        # Don't respect retry_after_header to implement custom retries
+        service_client.config.retry_policy.policy.respect_retry_after_header = False
+
+        return client
 
     def get_credentials(self):
         self._initialize_session()

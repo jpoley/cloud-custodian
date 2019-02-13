@@ -16,9 +16,10 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 from botocore.exceptions import ClientError
 
 from c7n.actions import BaseAction
-from c7n.filters.vpc import SubnetFilter, SecurityGroupFilter
+from c7n.filters.vpc import SubnetFilter, SecurityGroupFilter, VpcFilter
 from c7n.manager import resources
-from c7n.query import QueryResourceManager
+from c7n.query import QueryResourceManager, DescribeSource, ConfigSource
+from c7n.tags import universal_augment
 from c7n.utils import local_session, get_retry, type_schema
 
 
@@ -32,7 +33,7 @@ class CodeRepository(QueryResourceManager):
         enum_spec = ('list_repositories', 'repositories', None)
         batch_detail_spec = (
             'batch_get_repositories', 'repositoryNames', 'repositoryName',
-            'repositories')
+            'repositories', None)
         id = 'repositoryId'
         name = 'repositoryName'
         date = 'creationDate'
@@ -81,22 +82,49 @@ class CodeBuildProject(QueryResourceManager):
         service = 'codebuild'
         enum_spec = ('list_projects', 'projects', None)
         batch_detail_spec = (
-            'batch_get_projects', 'names', None, 'projects')
+            'batch_get_projects', 'names', None, 'projects', None)
         name = id = 'name'
+        arn = 'arn'
         date = 'created'
         dimension = None
         filter_name = None
         config_type = "AWS::CodeBuild::Project"
+        type = 'project'
+        universal_taggable = object()
+
+    def get_source(self, source_type):
+        if source_type == 'describe':
+            return DescribeBuild(self)
+        elif source_type == 'config':
+            return ConfigSource(self)
+        raise ValueError("Unsupported source: %s for %s" % (
+            source_type, self.resource_type.config_type))
 
 
+class DescribeBuild(DescribeSource):
+
+    def augment(self, resources):
+        return universal_augment(
+            self.manager,
+            super(DescribeBuild, self).augment(resources))
+
+
+@CodeBuildProject.filter_registry.register('subnet')
 class BuildSubnetFilter(SubnetFilter):
 
     RelatedIdsExpression = "vpcConfig.subnets[]"
 
 
+@CodeBuildProject.filter_registry.register('security-group')
 class BuildSecurityGroupFilter(SecurityGroupFilter):
 
     RelatedIdsExpression = "vpcConfig.securityGroupIds[]"
+
+
+@CodeBuildProject.filter_registry.register('vpc')
+class BuildVpcFilter(VpcFilter):
+
+    RelatedIdsExpression = "vpcConfig.vpcId"
 
 
 @CodeBuildProject.action_registry.register('delete')

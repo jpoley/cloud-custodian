@@ -14,11 +14,9 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 from datetime import datetime
-from dateutil import zoneinfo
+from dateutil import tz as tzutil
 
 from .common import BaseTest
-from botocore.exceptions import ClientError
-from c7n.resources.asg import NotEncryptedFilter
 
 
 class LaunchConfigTest(BaseTest):
@@ -116,30 +114,6 @@ class AutoScalingTest(BaseTest):
         resources = p.run()
         self.assertEqual(len(resources), 1)
         self.assertEqual(resources[0]["Unencrypted"], ["Image", "LaunchConfig"])
-
-    def test_get_bad_snapshot_malformed(self):
-        operation_name = "DescribeSnapshots"
-        error_response = {
-            "Error": {
-                "Message": 'Invalid id: "snap-malformedsnap"',
-                "Code": "InvalidSnapshotID.Malformed",
-            }
-        }
-        e = ClientError(error_response, operation_name)
-        snap = NotEncryptedFilter.get_bad_snapshot(e)
-        self.assertEqual(snap, "snap-malformedsnap")
-
-    def test_get_bad_snapshot_notfound(self):
-        operation_name = "DescribeSnapshots"
-        error_response = {
-            "Error": {
-                "Message": "The snapshot 'snap-notfound' does not exist.",
-                "Code": "InvalidSnapshot.NotFound",
-            }
-        }
-        e = ClientError(error_response, operation_name)
-        snap = NotEncryptedFilter.get_bad_snapshot(e)
-        self.assertEqual(snap, "snap-notfound")
 
     def test_asg_image_age_filter(self):
         factory = self.replay_flight_data("test_asg_image_age_filter")
@@ -296,7 +270,7 @@ class AutoScalingTest(BaseTest):
         session_factory = self.replay_flight_data("test_asg_mark_for_op_hours")
         session = session_factory(region="us-east-1")
         asg = session.client("autoscaling")
-        localtz = zoneinfo.gettz("America/New_York")
+        localtz = tzutil.gettz("America/New_York")
         dt = datetime.now(localtz)
         dt = dt.replace(
             year=2018, month=2, day=20, hour=12, minute=42, second=0, microsecond=0
