@@ -1,30 +1,89 @@
-# Copyright 2018 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 
+from c7n.filters import ListItemFilter
+from c7n.utils import type_schema
 from c7n_azure.provider import resources
 from c7n_azure.resources.arm import ArmResourceManager
 
 
 @resources.register('redis')
 class Redis(ArmResourceManager):
+    """Redis Resource
+
+    :example:
+
+    This policy will find all Redis caches with more than 1000 cache misses in the last 72 hours
+
+    .. code-block:: yaml
+
+        policies:
+          - name: redis-cache-misses
+            resource: azure.redis
+            filters:
+              - type: metric
+                metric: cachemisses
+                op: ge
+                aggregation: count
+                threshold: 1000
+                timeframe: 72
+
+    """
 
     class resource_type(ArmResourceManager.resource_type):
+        doc_groups = ['Databases']
+
         service = 'azure.mgmt.redis'
         client = 'RedisManagementClient'
-        enum_spec = ('redis', 'list', None)
+        enum_spec = ('redis', 'list_by_subscription', None)
         default_report_fields = (
             'name',
             'location',
-            'resourceGroup'
+            'resourceGroup',
+            'properties.redisVersion',
+            'properties.sku.[name, family, capacity]'
         )
+        resource_type = 'Microsoft.Cache/Redis'
+
+
+@Redis.filter_registry.register('firewall')
+class RedisFirewallFilter(ListItemFilter):
+    """
+    Filter redis caches based on their firewall rules
+
+    :example:
+
+    This policy will find all the redis caches exposed to the public Internet
+
+    .. code-block: yaml
+
+        policies:
+          - name: exposed-redis
+            resource: azure.redis
+            filters:
+              - type: firewall
+                attrs:
+                  - type: value
+                    key: properties.startIP
+                    value: 0.0.0.0
+                  - type: value
+                    key: properties.endIP
+                    value: 0.0.0.0
+
+    """
+    schema = type_schema(
+        "firewall",
+        attrs={"$ref": "#/definitions/filters_common/list_item_attrs"},
+        count={"type": "number"},
+        count_op={"$ref": "#/definitions/filters_common/comparison_operators"}
+    )
+    annotate_items = True
+    item_annotation_key = "c7n:FirewallRules"
+
+    def get_item_values(self, resource):
+        client = self.manager.get_client()
+        rules = client.firewall_rules.list(
+            cache_name=resource["name"],
+            resource_group_name=resource["resourceGroup"]
+        )
+        return [rule.serialize(True) for rule in rules]

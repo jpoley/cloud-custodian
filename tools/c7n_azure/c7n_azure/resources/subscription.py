@@ -1,42 +1,59 @@
-# Copyright 2016-2017 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-from __future__ import absolute_import, division, print_function, unicode_literals
-
-import six
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 
 from azure.mgmt.resource.policy.models import PolicyAssignment
-from azure.mgmt.subscription import SubscriptionClient
+from azure.mgmt.resource import SubscriptionClient
+from azure.mgmt.monitor import MonitorManagementClient
 
 from c7n.actions import BaseAction
 from c7n.exceptions import PolicyValidationError
 from c7n.filters.missing import Missing
+from c7n.filters.core import ValueFilter
 from c7n.manager import ResourceManager
 from c7n.utils import local_session, type_schema
 
 from c7n_azure.provider import resources
-from c7n_azure.query import QueryMeta
+from c7n_azure.query import QueryMeta, TypeInfo
 
 
 @resources.register('subscription')
-@six.add_metaclass(QueryMeta)
-class Subscription(ResourceManager):
+class Subscription(ResourceManager, metaclass=QueryMeta):
+    """Subscription Resource
 
-    class resource_type(object):
+    :example:
+
+    This policy creates Azure Policy scoped to the current subscription if doesn't exist.
+
+    .. code-block:: yaml
+
+        policies:
+          - name: azure-policy-sample
+            resource: azure.subscription
+            filters:
+              - type: missing
+                policy:
+                  resource: azure.policyassignments
+                  filters:
+                    - type: value
+                      key: properties.displayName
+                      op: eq
+                      value_type: normalize
+                      value: dn_sample_policy
+            actions:
+              - type: add-policy
+                name: sample_policy
+                display_name: dn_sample_policy
+                definition_name: "Audit use of classic storage accounts"
+
+    """
+
+    class resource_type(TypeInfo):
+        doc_groups = ['Subscription']
+
         id = 'subscriptionId'
         name = 'displayName'
         filter_name = None
+        service = 'subscription'
 
     def get_model(self):
         return self.resource_type
@@ -50,11 +67,108 @@ class Subscription(ResourceManager):
     def _get_subscription(self, session_factory, config):
         session = local_session(session_factory)
         client = SubscriptionClient(session.get_credentials())
-        details = client.subscriptions.get(subscription_id=session.subscription_id)
+        details = client.subscriptions.get(subscription_id=session.get_subscription_id())
         return details.serialize(True)
 
 
 Subscription.filter_registry.register('missing', Missing)
+
+
+@Subscription.filter_registry.register('diagnostic-settings')
+class SubscriptionDiagnosticSettingFilter(ValueFilter):
+    """Filter by diagnostic settings for this subscription
+
+    Each diagnostic setting for the subscription is made available to the filter. The data format
+    is the result of making the following Azure API call and extracting the "value" property:
+    https://learn.microsoft.com/en-us/rest/api/monitor/subscription-diagnostic-settings/list?tabs=HTTP
+
+    :example:
+
+    Example JSON document showing the data format provided to the filter
+
+    .. code-block:: json
+        {
+          "id": "...",
+          "name": "...",
+          "properties": {
+            "eventHubAuthorizationRuleId": "...",
+            "eventHubName": "...",
+            "logs": [
+              { "category": "Administrative", "enabled": true },
+              { "category": "Security", "enabled": false }
+            ],
+            "marketplacePartnerId": "...",
+            "serviceBusRuleId": "...",
+            "storageAccountId": "...",
+            "workspaceId": "..."
+          },
+          "systemData": {}
+          "type": "..."
+        }
+
+    :example:
+
+    Check if the subscription has Security logs enabled in at least one setting
+
+    .. code-block:: yaml
+
+        policies:
+          - name: subscription-security-logs-enabled
+            resource: azure.subscription
+            filters:
+              - not:
+                - type: diagnostic-settings
+                  key: "properties.logs[?category == 'Security'].enabled[]"
+                  op: contains
+                  value: true
+
+    """
+
+    cache_key = 'c7n:diagnostic-settings'
+
+    schema = type_schema(
+        'diagnostic-settings',
+        rinherit=ValueFilter.schema
+    )
+
+    def _get_subscription_diagnostic_settings(self, session, subscription_id):
+        client = MonitorManagementClient(
+            session.get_credentials(),
+            subscription_id=subscription_id
+        )
+
+        query = client.subscription_diagnostic_settings.list(subscription_id)
+
+        settings = query.serialize(True).get('value', [])
+
+        # put an empty item in when no diag settings so the absent operator can function
+        if not settings:
+            settings = [{}]
+
+        return settings
+
+    def process(self, resources, event=None):
+        session = local_session(self.manager.session_factory)
+
+        matched = []
+        for resource in resources:
+            subscription_id = resource['subscriptionId']
+
+            if self.cache_key in resource:
+                settings = resource[self.cache_key]
+            else:
+                settings = self._get_subscription_diagnostic_settings(
+                    session,
+                    subscription_id
+                )
+                resource[self.cache_key] = settings
+
+            filtered_settings = super().process(settings, event=None)
+
+            if filtered_settings:
+                matched.append(resource)
+
+        return matched
 
 
 @Subscription.action_registry.register('add-policy')

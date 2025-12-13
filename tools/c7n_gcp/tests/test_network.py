@@ -1,18 +1,9 @@
-# Copyright 2018-2019 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
+import time
 
-from gcp_common import BaseTest
+from gcp_common import BaseTest, event_data
+from googleapiclient.errors import HttpError
 
 
 class FirewallTest(BaseTest):
@@ -27,6 +18,72 @@ class FirewallTest(BaseTest):
             'firewall_rule_id': '4746899906201084445',
             'project_id': 'cloud-custodian'})
         self.assertEqual(fw['name'], 'allow-inbound-xyz')
+        self.assertEqual(
+            p.resource_manager.get_urns([fw]),
+            ["gcp:compute::cloud-custodian:firewall/allow-inbound-xyz"],
+        )
+
+    def test_firewall_modify(self):
+        project_id = 'cloud-custodian'
+        factory = self.replay_flight_data('firewall-modify', project_id=project_id)
+        p = self.load_policy(
+            {'name': 'fdelete',
+             'resource': 'gcp.firewall',
+             'filters': [{'name': 'test'}],
+             'actions': [{'type': 'modify', 'priority': 500, 'targetTags': ['newtag']}]
+             },
+            session_factory=factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        if self.recording:
+            time.sleep(5)
+        client = p.resource_manager.get_client()
+        result = client.execute_query('get', {'project': project_id, 'firewall': 'test'})
+        self.assertEqual(result["targetTags"][0], 'newtag')
+        self.assertEqual(result["priority"], 500)
+
+    def test_firewall_delete(self):
+        project_id = 'cloud-custodian'
+        factory = self.replay_flight_data('firewall-delete', project_id=project_id)
+        p = self.load_policy(
+            {'name': 'fdelete',
+             'resource': 'gcp.firewall',
+             'filters': [{'name': 'test'}],
+             'actions': ['delete']},
+            session_factory=factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        if self.recording:
+            time.sleep(5)
+        client = p.resource_manager.get_client()
+        try:
+            result = client.execute_query(
+                'get', {'project': project_id,
+                        'firewall': 'test'})
+            self.fail('found deleted firewall: %s' % result)
+        except HttpError as e:
+            self.assertTrue("was not found" in str(e))
+
+
+class NetworkTest(BaseTest):
+
+    def test_network_get(self):
+        factory = self.replay_flight_data(
+            'network-get-resource', project_id='cloud-custodian')
+        p = self.load_policy({'name': 'network', 'resource': 'gcp.vpc'},
+                             session_factory=factory)
+        network = p.resource_manager.get_resource({
+            "resourceName":
+                "//compute.googleapis.com/projects/cloud-custodian/"
+                "global/networks/default"})
+        self.assertEqual(network['name'], 'default')
+        self.assertEqual(network['autoCreateSubnetworks'], True)
+        self.assertEqual(
+            p.resource_manager.get_urns([network]),
+            [
+                'gcp:compute::cloud-custodian:vpc/default',
+            ],
+        )
 
 
 class SubnetTest(BaseTest):
@@ -37,12 +94,18 @@ class SubnetTest(BaseTest):
         p = self.load_policy({'name': 'subnet', 'resource': 'gcp.subnet'},
                              session_factory=factory)
         subnet = p.resource_manager.get_resource({
-            "location": "us-central1",
+            "resourceName":
+                "//compute.googleapis.com/projects/cloud-custodian/"
+                "regions/us-central1/subnetworks/default",
             "project_id": "cloud-custodian",
-            "subnetwork_id": "4686700484947109325",
             "subnetwork_name": "default"})
         self.assertEqual(subnet['name'], 'default')
         self.assertEqual(subnet['privateIpGoogleAccess'], True)
+
+        self.assertEqual(
+            p.resource_manager.get_urns([subnet]),
+            ["gcp:compute:us-central1:cloud-custodian:subnet/default"],
+        )
 
     def test_subnet_set_flow(self):
         project_id = 'cloud-custodian'
@@ -89,3 +152,143 @@ class SubnetTest(BaseTest):
                     'region': 'us-central1',
                     'subnetwork': subnet['name']})
         self.assertEqual(result['privateIpGoogleAccess'], True)
+
+
+class RouterTest(BaseTest):
+    def test_router_query(self):
+        project_id = 'cloud-custodian'
+        session_factory = self.replay_flight_data('router-query', project_id=project_id)
+
+        policy = {
+            'name': 'all-routers',
+            'resource': 'gcp.router'
+        }
+
+        policy = self.load_policy(
+            policy,
+            session_factory=session_factory)
+
+        resources = policy.run()
+        self.assertEqual(resources[0]['name'], 'test-router')
+        self.assertEqual(
+            policy.resource_manager.get_urns(resources),
+            ["gcp:compute:us-central1:cloud-custodian:router/test-router"],
+        )
+
+    def test_router_get(self):
+        project_id = 'cloud-custodian'
+        factory = self.replay_flight_data('router-get', project_id=project_id)
+
+        p = self.load_policy({
+            'name': 'router-created',
+            'resource': 'gcp.router',
+            'mode': {
+                'type': 'gcp-audit',
+                'methods': ['beta.compute.routers.insert']}},
+            session_factory=factory)
+
+        exec_mode = p.get_execution_mode()
+        event = event_data('router-create.json')
+        routers = exec_mode.run(event, None)
+
+        self.assertEqual(len(routers), 1)
+        self.assertEqual(routers[0]['bgp']['asn'], 65001)
+        self.assertEqual(
+            p.resource_manager.get_urns(routers),
+            ["gcp:compute:us-central1:cloud-custodian:router/test-router-2"],
+        )
+
+    def test_router_delete(self):
+        project_id = 'cloud-custodian'
+        factory = self.replay_flight_data('router-delete', project_id=project_id)
+
+        p = self.load_policy(
+            {'name': 'delete-router',
+             'resource': 'gcp.router',
+             'filters': [{'name': 'test-router'}],
+             'actions': ['delete']},
+            session_factory=factory)
+
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+
+        if self.recording:
+            time.sleep(5)
+
+        client = p.resource_manager.get_client()
+        result = client.execute_query(
+            'list', {'project': project_id,
+                     'region': 'us-central1',
+                     'filter': 'name = test-router'})
+
+        self.assertEqual(result.get('items', []), [])
+
+
+class RouteTest(BaseTest):
+    def test_route_query(self):
+        project_id = 'cloud-custodian'
+        session_factory = self.replay_flight_data('route-query', project_id=project_id)
+
+        policy = {
+            'name': 'all-routes',
+            'resource': 'gcp.route'
+        }
+
+        policy = self.load_policy(
+            policy,
+            session_factory=session_factory)
+
+        resources = policy.run()
+        self.assertEqual(resources[0]['destRange'], '10.160.0.0/20')
+        self.assertEqual(
+            policy.resource_manager.get_urns(resources),
+            ["gcp:compute::cloud-custodian:route/default-route-f414047c633f96ab"],
+        )
+
+    def test_route_get(self):
+        project_id = 'cloud-custodian'
+        factory = self.replay_flight_data('route-get', project_id=project_id)
+
+        p = self.load_policy({
+            'name': 'route-created',
+            'resource': 'gcp.route',
+            'mode': {
+                'type': 'gcp-audit',
+                'methods': ['v1.compute.routes.insert']}},
+            session_factory=factory)
+
+        exec_mode = p.get_execution_mode()
+        event = event_data('route-create.json')
+        routes = exec_mode.run(event, None)
+
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(routes[0]['destRange'], '10.0.0.0/24')
+        self.assertEqual(
+            p.resource_manager.get_urns(routes),
+            ["gcp:compute::cloud-custodian:route/test-route-2"],
+        )
+
+
+class TestVPCFirewallFilter(BaseTest):
+
+    def test_vpc_firewall_filter_query(self):
+        project_id = 'cloud-custodian'
+        factory = self.replay_flight_data(
+            'test_vpc_firewall_filter_query', project_id=project_id)
+        p = self.load_policy(
+            {'name': 'vpc-firewall',
+             'resource': 'gcp.vpc',
+             'filters': [{
+                 'type': 'firewall',
+                 'attrs': [{
+                     'type': 'value',
+                     'key': 'id',
+                     'op': 'eq',
+                     'value': '2383043984399442858'
+                 }]
+             }]}, validate=True, session_factory=factory)
+
+        resources = p.run()
+
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]['kind'], 'compute#network')

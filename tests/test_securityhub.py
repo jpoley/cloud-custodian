@@ -1,26 +1,120 @@
-# Copyright 2018 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 
-from .common import BaseTest
-
-import time
 from c7n.exceptions import PolicyValidationError
+from c7n.resources.aws import shape_validate
+from .common import BaseTest, event_data
+
+import logging
+import time
 
 LambdaFindingId = "us-east-2/644160558196/81cc9d38b8f8ebfd260ecc81585b4bc9/9f5932aa97900b5164502f41ae393d23" # NOQA
 
 
+class SecurityHubMode(BaseTest):
+
+    def test_resolve_import_finding(self):
+        factory = self.replay_flight_data('test_security_hub_mode_resolve')
+        policy = self.load_policy({
+            'name': 'trail-fixer',
+            'resource': 'aws.iam-user',
+            'mode': {
+                'type': 'hub-finding',
+                'role': 'foo'}},
+            session_factory=factory)
+        event = event_data("event-securityhub-iamkey-finding-action.json")
+        hub = policy.get_execution_mode()
+        resources = hub.resolve_import_finding(event)
+        self.assertEqual(
+            sorted(resources),
+            sorted(['arn:aws:iam::644160558196:user/kapil']))
+        resources = hub.resolve_resources(event)
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]['UserName'], 'kapil')
+
+    def test_resolve_action_finding(self):
+        policy = self.load_policy({
+            'name': 'trail-fixer',
+            'resource': 'aws.cloudtrail',
+            'mode': {
+                'type': 'hub-finding',
+                'role': 'foo'}})
+        event = event_data("event-securityhub-cloudtrail-finding-action.json")
+        hub = policy.get_execution_mode()
+        resources = hub.resolve_action_finding(event)
+        self.assertEqual(
+            sorted(resources),
+            sorted([
+                'arn:aws:cloudtrail:us-east-1:644160558196:trail/skunk-trails']))
+
+    def test_resolve_action_insight(self):
+        factory = self.replay_flight_data(
+            "test_security_hub_mode_action_insight")
+        policy = self.load_policy({
+            'name': 'iam-key',
+            'resource': 'aws.iam-user',
+            'mode': {
+                'type': 'hub-action',
+                'role': 'foo'}},
+            session_factory=factory)
+        hub = policy.get_execution_mode()
+        event = event_data("event-securityhub-insight-2.json")
+        resources = hub.resolve_action_insight(event)
+        self.assertEqual(
+            sorted(resources),
+            sorted([
+                'arn:aws:iam::644160558196:user/brent.clements',
+                'arn:aws:iam::644160558196:user/david.shepherd2',
+                'arn:aws:iam::644160558196:user/david.yun',
+                'arn:aws:iam::644160558196:user/kapil']))
+
+    def test_resolve_multi_account_resource_sets(self):
+        factory = self.replay_flight_data(
+            'test_security_hub_multi_account_mode')
+        policy = self.load_policy({
+            'name': 'lambda-remediate',
+            'resource': 'aws.lambda',
+            'mode': {
+                'type': 'hub-action',
+                'role': 'CustodianPolicyExecution',
+                'member-role': 'arn:aws:iam::{account_id}:role/CustodianGuardDuty'
+            }},
+            config={'region': 'us-east-2',
+                    'account_id': '519413311747'},
+            session_factory=factory)
+        hub = policy.get_execution_mode()
+        event = event_data('event-securityhub-lambda-cross.json')
+        partition_resources = hub.get_resource_sets(event)
+        self.assertEqual(
+            {p: list(map(repr, v)) for p, v in partition_resources.items()},
+            {('644160558196', 'us-east-1'): [
+                ("<arn:aws:lambda:us-east-1:644160558196:function:"
+                 "custodian-enterprise-ec2-instances-no-elastic-ip-isolate>")
+            ]})
+        output = self.capture_logging(policy.log.name, level=logging.INFO)
+        results = hub.run(event, {})
+        self.assertIn('Assuming member role:arn:aws:iam::644160558196', output.getvalue())
+        self.assertEqual(
+            results[('644160558196', 'us-east-1')][0]['FunctionName'],
+            'custodian-enterprise-ec2-instances-no-elastic-ip-isolate')
+
+
 class SecurityHubTest(BaseTest):
+
+    def test_custom_classifier(self):
+        templ = {
+            'name': 's3',
+            'resource': 's3',
+            'actions': [{'type': 'post-finding',
+                         'types': ['Effects/CustomB/CustomA']}]}
+        self.load_policy(templ)
+        templ['actions'][0]['types'] = ['CustomA/CustomB/CustomC']
+        self.assertRaises(PolicyValidationError, self.load_policy, templ)
+        templ['actions'][0]['types'] = ['Effects/CustomB/CustomA/CustomD']
+        self.assertRaises(PolicyValidationError, self.load_policy, templ)
+        templ['actions'][0]['types'] = []
+        self.assertRaises(
+            PolicyValidationError, self.load_policy, templ, validate=True)
 
     def test_s3_bucket_arn(self):
         policy = self.load_policy({
@@ -30,7 +124,7 @@ class SecurityHubTest(BaseTest):
                 {'type': 'post-finding',
                  'types': [
                      "Software and Configuration Checks/AWS Security Best Practices/Network Reachability"  # NOQA
-                     ]}]})
+                 ]}]})
         post_finding = policy.resource_manager.actions[0]
         resource = post_finding.format_resource(
             {'Name': 'xyz', 'CreationDate': 'xtf'})
@@ -46,6 +140,7 @@ class SecurityHubTest(BaseTest):
                 "actions": [
                     {
                         "type": "post-finding",
+                        'description': 'This one is important',
                         "types": [
                             "Software and Configuration Checks/AWS Security Best Practices/Network Reachability"  # NOQA
                         ],
@@ -110,6 +205,7 @@ class SecurityHubTest(BaseTest):
                     "type": "post-finding",
                     "severity": 10,
                     "severity_normalized": 10,
+                    "severity_label": "INFORMATIONAL",
                     "types": [
                         "Software and Configuration Checks/AWS Security Best Practices"
                     ],
@@ -248,41 +344,8 @@ class SecurityHubTest(BaseTest):
             config={"account_id": "101010101111"},
             session_factory=factory,
         )
-        policy.validate()
         resources = policy.run()
         self.assertEqual(len(resources), 1)
-
-    def test_instance_findings_filter_fail_validate(self):
-        # Reuse recorded data
-        factory = self.replay_flight_data("test_security_hub_instance_findings_filter")
-        policy = self.load_policy(
-            {
-                "name": "ec2-findings-filter",
-                "resource": "ec2",
-                "filters": [{
-                    "type": "finding",
-                    "query": {"Type": [{
-                        "Value": "Software and Configuration Checks/ForceValidationFailure",
-                        "Comparison": "EQUALS"}]}
-                }],
-            },
-            config={"account_id": "101010101111"},
-            session_factory=factory,
-            validate=False
-        )
-        self.assertRaises(PolicyValidationError, policy.validate())
-        # test absert filter_json
-        policy = self.load_policy(
-            {
-                "name": "ec2-findings-filter",
-                "resource": "ec2",
-                "filters": [{
-                    "type": "finding",
-                }],
-            },
-            config={"account_id": "101010101111"},
-            session_factory=factory,
-        )
 
     def test_alb_findings_filter(self):
         factory = self.replay_flight_data("test_security_hub_alb_findings_filter")
@@ -372,61 +435,6 @@ class SecurityHubTest(BaseTest):
                     "Other": {
                         "CreateDate": "2016-09-10T15:45:42+00:00",
                         "UserId": "AIDAJYFPV7WUG3EV7MIIO"
-                    }
-                }
-            }
-        )
-
-    def test_iam_role(self):
-        factory = self.replay_flight_data("test_security_hub_iam_role")
-
-        policy = self.load_policy(
-            {
-                "name": "iam-role-finding",
-                "resource": "iam-role",
-                "filters": [{"type": "value", "key": "RoleName", "value": "app1"}],
-                "actions": [
-                    {
-                        "type": "post-finding",
-                        "severity": 10,
-                        "severity_normalized": 10,
-                        "types": [
-                            "Software and Configuration Checks/AWS Security Best Practices"
-                        ],
-                    }
-                ],
-            },
-            config={"account_id": "101010101111"},
-            session_factory=factory,
-        )
-
-        resources = policy.run()
-        self.assertEqual(len(resources), 1)
-
-        client = factory().client("securityhub")
-        findings = client.get_findings(
-            Filters={
-                "ResourceId": [
-                    {
-                        "Value": "arn:aws:iam::1010101011111:role/app1",
-                        "Comparison": "EQUALS",
-                    }
-                ]
-            }
-        ).get("Findings")
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(
-            findings[0]["Resources"][0],
-            {
-                "Region": "us-east-1",
-                "Type": "Other",
-                "Id": "arn:aws:iam::101010101111:role/app1",
-                "Details": {
-                    "Other": {
-                        "RoleName": "app1",
-                        "CreateDate": "2017-11-18T22:29:22+00:00",
-                        "c7n:MatchedFilters": "[\"tag:CostCenter\", \"tag:Project\"]",
-                        "RoleId": "AROAIV5QVPWUHSYPBTURM"
                     }
                 }
             }
@@ -551,7 +559,7 @@ class SecurityHubTest(BaseTest):
                 "name": "rds-finding",
                 "resource": "rds",
                 "filters": [
-                ],
+                    {"DBInstanceArn": "arn:aws:rds:us-west-2:644160558196:db:test-instance-3"}],
                 "actions": [
                     {
                         "type": "post-finding",
@@ -563,48 +571,117 @@ class SecurityHubTest(BaseTest):
                     }
                 ],
             },
-            config={"account_id": "101010101111"},
+            config={'region': 'us-west-2', 'account_id': '644160558196'},
             session_factory=factory,
         )
 
         resources = policy.run()
         self.assertEqual(len(resources), 1)
+        rfinding = policy.resource_manager.actions[0].format_resource(resources[0])
+        shape_validate(
+            rfinding['Details']['AwsRdsDbInstance'],
+            'AwsRdsDbInstanceDetails', 'securityhub')
+
+        client = factory().client("securityhub", region_name='us-west-2')
+        findings = client.get_findings(
+            Filters={
+                'Title': [
+                    {
+                        'Value': 'rds-finding',
+                        'Comparison': 'EQUALS'
+                    }
+                ],
+                'ResourceId': [
+                    {
+                        'Value': 'arn:aws:rds:us-west-2:644160558196:db:test-instance-3',
+                        'Comparison': 'EQUALS'
+                    }
+                ]
+            }
+        ).get('Findings', [])
+        self.assertEqual(len(findings), 1)
+
+        self.assertEqual(
+            findings[0]["Resources"][0],
+            {
+                'Type': 'AwsRdsDbInstance',
+                'Id': 'arn:aws:rds:us-west-2:644160558196:db:test-instance-3',
+                'Region': 'us-west-2',
+                'Details': {
+                    'AwsRdsDbInstance': {
+                        'CACertificateIdentifier': 'rds-ca-2019',
+                        'DBClusterIdentifier': 'test',
+                        'DBInstanceIdentifier': 'test-instance-3',
+                        'DBInstanceClass': 'db.m5d.xlarge',
+                        'DbiResourceId': 'db-EH6SVXMILRMDTBVY4GNOOI3OL4',
+                        'Engine': 'postgres',
+                        'EngineVersion': '13.7',
+                        'KmsKeyId': 'arn:aws:kms:us-west-2:644160558196:key/31e94e00-358a-4f53-8a0c-48ae90c8cc23',  # noqa
+                        'StorageEncrypted': True,
+                        'VpcSecurityGroups': [
+                            {
+                                'VpcSecurityGroupId': 'sg-0e255aed9188d1fba',
+                                'Status': 'active'
+                            }
+                        ],
+                        'MasterUsername': 'postgres',
+                        'AllocatedStorage': 400,
+                        'PreferredBackupWindow': '11:55-12:25',
+                        'BackupRetentionPeriod': 7,
+                        'AvailabilityZone': 'us-west-2b',
+                        'PreferredMaintenanceWindow': 'tue:07:49-tue:08:19',
+                        'LicenseModel': 'postgresql-license',
+                        'Iops': 3000,
+                        'OptionGroupMemberships': [
+                            {
+                                'OptionGroupName': 'default:postgres-13',
+                                'Status': 'in-sync'
+                            }
+                        ],
+                        'StorageType': 'io1',
+                        'PromotionTier': 1
+                    }
+                }
+            }
+        )
+
+    def test_larger_batch_s3(self):
+        factory = self.replay_flight_data("test_larger_batch")
+
+        policy = self.load_policy(
+            {
+                "name": "ebs-finding",
+                "resource": "ebs-snapshot",
+                "filters": [],
+                "actions": [
+                    {
+                        "type": "post-finding",
+                        "severity": 10,
+                        "severity_normalized": 10,
+                        "batch_size": 2,
+                        "title": "EBS Testing",
+                        "types": [
+                            "Software and Configuration Checks/AWS Security Best Practices"
+                        ],
+                    }
+                ],
+            },
+            session_factory=factory,
+        )
+
+        resources = policy.run()
+        self.assertEqual(len(resources), 2)
 
         client = factory().client("securityhub")
         findings = client.get_findings(
             Filters={
-                "ResourceId": [
+                "Title": [
                     {
-                        "Value": "arn:aws:rds:us-east-1:101010101111:db:testme",
+                        "Value": "EBS Testing",
                         "Comparison": "EQUALS",
                     }
                 ]
             }
         ).get("Findings")
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(
-            findings[0]["Resources"][0],
-            {
-                "Details": {
-                    "Other": {
-                        "Engine": "mariadb",
-                        "VpcId": "vpc-d6fe6cb1",
-                        "PubliclyAccessible": "False",
-                        "DBName": "testme",
-                        "AvailabilityZone": "us-east-1a",
-                        "InstanceCreateTime": "2018-11-05T03:25:12.384000+00:00",
-                        "StorageEncrypted": "False",
-                        "AllocatedStorage": "20",
-                        "EngineVersion": "10.3.8",
-                        "DBInstanceClass": "db.t2.micro",
-                        "DBSubnetGroupName": "default"
-                    }
-                },
-                "Region": "us-east-1",
-                "Type": "Other",
-                "Id": "arn:aws:rds:us-east-1:101010101111:db:testme",
-                "Tags": {
-                    "workload-type": "other"
-                }
-            }
-        )
+
+        self.assertEqual(len(findings), 2)

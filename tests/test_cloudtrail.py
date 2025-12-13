@@ -1,24 +1,21 @@
-# Copyright 2018 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 import time
-
-from .common import BaseTest, TestConfig as Config
+from .common import BaseTest
 
 
 class CloudTrail(BaseTest):
+
+    def test_trail_tag_augment(self):
+        factory = self.replay_flight_data('test_trail_tag_augment')
+        p = self.load_policy({
+            'name': 'resource',
+            'resource': 'aws.cloudtrail',
+            'filters': [{'tag:App': 'c7n'}]},
+            session_factory=factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]['Name'], 'skunk-trails')
 
     def test_trail_status(self):
         factory = self.replay_flight_data('test_cloudtrail_status')
@@ -30,6 +27,28 @@ class CloudTrail(BaseTest):
         resources = p.run()
         self.assertEqual(len(resources), 1)
         self.assertTrue('c7n:TrailStatus' in resources[0])
+
+    def test_event_selectors(self):
+        factory = self.replay_flight_data('test_cloudtrail_event_selectors')
+        p = self.load_policy({
+            'name': 'resource',
+            'resource': 'cloudtrail',
+            'filters': [{
+                'type': 'event-selectors',
+                'key': 'EventSelectors[].IncludeManagementEvents',
+                'op': 'contains',
+                'value': True
+            }]},
+            session_factory=factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 4)
+
+        for resource in resources:
+            self.assertTrue('c7n:TrailEventSelectors' in resource)
+            selectors = resource['c7n:TrailEventSelectors']['EventSelectors']
+            self.assertEqual(len(selectors), 1)
+            self.assertTrue('IncludeManagementEvents' in selectors[0])
+            self.assertTrue(selectors[0]['IncludeManagementEvents'])
 
     def test_trail_update(self):
         factory = self.replay_flight_data('test_cloudtrail_update')
@@ -90,6 +109,48 @@ class CloudTrail(BaseTest):
             resources[0]['TrailARN'],
             'arn:aws:cloudtrail:us-east-1:644160558196:trail/orgTrail')
 
+    def test_is_shadow_or_not(self):
+        factory = self.replay_flight_data('test_cloudtrail_is_shadow_or_not')
+        p = self.load_policy({
+            'name': 'resource',
+            'resource': 'cloudtrail',
+            'filters': ['is-shadow']},
+            session_factory=factory, config={'region': 'us-east-1'})
+        resources = p.run()
+        self.assertEqual(1, len(resources))
+        self.assertEqual(
+            'arn:aws:cloudtrail:us-east-2:123456789012:trail/MultiRegion2CloudTrail',
+            resources[0]['TrailARN'])
+
+    def test_is_shadow_not(self):
+        factory = self.replay_flight_data('test_cloudtrail_is_shadow_or_not')
+        p = self.load_policy({
+            'name': 'resource',
+            'resource': 'cloudtrail',
+            'filters': [{'type': 'is-shadow', 'state': False}]},
+            session_factory=factory, config={'region': 'us-east-1'})
+        resources = p.run()
+        self.assertEqual(2, len(resources))
+        self.assertEqual(
+            'arn:aws:cloudtrail:us-east-1:123456789012:trail/MultiRegion1CloudTrail',
+            resources[0]['TrailARN'])
+        self.assertEqual(
+            'arn:aws:cloudtrail:us-east-1:123456789012:trail/SingleCloudTrail',
+            resources[1]['TrailARN'])
+
+    def test_is_shadow_multiregion(self):
+        factory = self.replay_flight_data('test_cloudtrail_is_shadow_or_not')
+        p = self.load_policy({
+            'name': 'resource',
+            'resource': 'cloudtrail',
+            'filters': ['is-shadow']},
+            session_factory=factory, config={'region': 'us-east-2'})
+        resources = p.run()
+        self.assertEqual(1, len(resources))
+        self.assertEqual(
+            'arn:aws:cloudtrail:us-east-1:123456789012:trail/MultiRegion1CloudTrail',
+            resources[0]['TrailARN'])
+
     def test_cloudtrail_resource_with_not_filter(self):
         factory = self.replay_flight_data("test_cloudtrail_resource_with_not_filter")
         p = self.load_policy(
@@ -104,8 +165,30 @@ class CloudTrail(BaseTest):
                     }]
                 }]
             },
-            config=Config.empty(),
             session_factory=factory,
         )
         resources = p.run()
         self.assertEqual(len(resources), 1)
+
+    def test_cloudtrail_delete(self):
+        factory = self.replay_flight_data("test_cloudtrail_delete")
+        p = self.load_policy(
+            {
+                "name": "cloudtrail-resource",
+                "resource": "cloudtrail",
+                "filters": [{'type': 'value', 'key': 'Name', 'value': 'delete-me'}],
+                'actions': [{'type': 'delete'}],
+            },
+            session_factory=factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]['Name'], 'delete-me')
+
+        if self.recording:
+            time.sleep(3)
+
+        client = factory().client('cloudtrail')
+        self.assertRaises(
+            client.exceptions.TrailNotFoundException,
+            client.delete_trail,
+            Name=resources[0]['Name'])

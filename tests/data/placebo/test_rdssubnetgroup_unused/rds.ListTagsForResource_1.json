@@ -1,11 +1,7 @@
 {
-  "status_code": 200,
-  "data": {
-        "TagList": [
-        {
-            "Key": "string",
-            "Value": "string"
-        }
-    ]
-  }
+    "status_code": 200,
+    "data": {
+        "TagList": [],
+        "ResponseMetadata": {}
+    }
 }

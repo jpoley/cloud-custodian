@@ -1,21 +1,25 @@
 {
-    "status_code": 400, 
+    "status_code": 200,
     "data": {
-        "ResponseMetadata": {
-            "RetryAttempts": 0, 
-            "HTTPStatusCode": 400, 
-            "RequestId": "85ca547b-b0d5-4a31-aa53-39afcc751a50", 
-            "HTTPHeaders": {
-                "date": "Tue, 30 Jan 2018 21:31:13 GMT", 
-                "x-amzn-requestid": "85ca547b-b0d5-4a31-aa53-39afcc751a50", 
-                "content-length": "134", 
-                "content-type": "application/x-amz-json-1.1", 
-                "connection": "keep-alive"
-            }
-        }, 
-        "Error": {
-            "Message": "Could not find model \"arn:aws:sagemaker:us-east-1:644160558196:model/tmp-for-test-123\".", 
-            "Code": "ValidationException"
-        }
+        "ModelName": "sagemaker-model",
+        "PrimaryContainer": {
+            "Image": "644160558196.dkr.ecr.us-east-1.amazonaws.com/test:latest",
+            "Mode": "SingleModel",
+            "Environment": {}
+        },
+        "ExecutionRoleArn": "arn:aws:iam::644160558196:role/sagemaker-iam-role",
+        "CreationTime": {
+            "__class__": "datetime",
+            "year": 2021,
+            "month": 6,
+            "day": 21,
+            "hour": 5,
+            "minute": 1,
+            "second": 28,
+            "microsecond": 466000
+        },
+        "ModelArn": "arn:aws:sagemaker:us-east-1:644160558196:model/sagemaker-model",
+        "EnableNetworkIsolation": false,
+        "ResponseMetadata": {}
     }
 }

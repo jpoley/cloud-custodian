@@ -1,38 +1,45 @@
-# Copyright 2016-2017 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 from botocore.exceptions import ClientError
 
 from c7n.actions import BaseAction
+from c7n.filters import WafV2FilterBase
 from c7n.manager import resources
-from c7n.query import QueryResourceManager
+from c7n.query import QueryResourceManager, TypeInfo, DescribeSource
+from c7n.tags import universal_augment
 from c7n.utils import local_session, type_schema
+
+
+class DescribeIdentityPool(DescribeSource):
+    def augment(self, resources):
+        resources = super().augment(resources)
+        return universal_augment(self.manager, resources)
+
+
+class DescribeUserPool(DescribeSource):
+    def augment(self, resources):
+        resources = super().augment(resources)
+        return universal_augment(self.manager, resources)
 
 
 @resources.register('identity-pool')
 class CognitoIdentityPool(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'cognito-identity'
         enum_spec = ('list_identity_pools', 'IdentityPools', {'MaxResults': 60})
         detail_spec = (
             'describe_identity_pool', 'IdentityPoolId', 'IdentityPoolId', None)
         id = 'IdentityPoolId'
         name = 'IdentityPoolName'
-        filter_name = None
-        dimension = None
+        arn_type = "identitypool"
+        config_type = cfn_type = 'AWS::Cognito::IdentityPool'
+        universal_taggable = object()
+        permissions_augment = ("cognito-identity:ListTagsForResource",)
+
+    source_mapping = {
+        'describe': DescribeIdentityPool,
+    }
 
 
 @CognitoIdentityPool.action_registry.register('delete')
@@ -72,15 +79,53 @@ class DeleteIdentityPool(BaseAction):
 @resources.register('user-pool')
 class CognitoUserPool(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = "cognito-idp"
         enum_spec = ('list_user_pools', 'UserPools', {'MaxResults': 60})
         detail_spec = (
             'describe_user_pool', 'UserPoolId', 'Id', 'UserPool')
         id = 'Id'
         name = 'Name'
-        filter_name = None
-        dimension = None
+        arn = 'Arn'
+        arn_type = "userpool"
+        config_type = cfn_type = 'AWS::Cognito::UserPool'
+        universal_taggable = object()
+        permissions_augment = ("cognito-idp:ListTagsForResource",)
+
+    source_mapping = {
+        'describe': DescribeUserPool,
+    }
+
+
+@CognitoUserPool.filter_registry.register('wafv2-enabled')
+class WafV2Filter(WafV2FilterBase):
+    """Filter Cognito UserPool by wafv2 web-acl
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: filter-userpool-wafv2
+                resource: user-pool
+                filters:
+                  - type: wafv2-enabled
+                    state: false
+              - name: filter-userpool-wafv2-regex
+                resource: user-pool
+                filters:
+                  - type: wafv2-enabled
+                    state: false
+                    web-acl: .*FMManagedWebACLV2-?FMS-.*
+    """
+
+    # cognito user pools don't hold a reference to the associated web acl
+    # so we have to look them up via the associations on the web acl directly
+    def get_associated_web_acl(self, resource):
+        return self.get_web_acl_from_associations(
+            'COGNITO_USER_POOL',
+            resource['Arn']
+        )
 
 
 @CognitoUserPool.action_registry.register('delete')

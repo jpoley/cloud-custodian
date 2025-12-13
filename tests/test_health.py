@@ -1,17 +1,8 @@
-# Copyright 2017 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
+from c7n.exceptions import PolicyValidationError
+from c7n.resources.health import HealthQueryParser
+
 
 from .common import BaseTest
 
@@ -57,3 +48,50 @@ class HealthResource(BaseTest):
             self.assertTrue(
                 (r["eventTypeCategory"] == "accountNotification") ^ ("AffectedEntities" in r)
             )
+
+
+class TestHealthQueryParser(BaseTest):
+    def test_query(self):
+        self.assertEqual(HealthQueryParser.parse([]), [])
+
+        query = [
+            {'availabilityZones': 'us-east-1a'},
+            {'availabilityZones': 'us-east-1b'},
+            {'services': 'EC2'},
+            {'maxResults': 10}
+        ]
+        result_query = [
+            {'availabilityZones': ['us-east-1a', 'us-east-1b']},
+            {'services': ['EC2']},
+            {'maxResults': 10}
+        ]
+        self.assertEqual(HealthQueryParser.parse(query), result_query)
+
+        query = [{'eventStatusCodes': ['open', 'upcoming']}]
+        self.assertEqual(HealthQueryParser.parse(query), query)
+
+        query = [{"eventTypeCategories": 'issue'}]
+        self.assertEqual(HealthQueryParser.parse(query), [{"eventTypeCategories": ['issue']}])
+
+    def test_invalid_query(self):
+        self.assertRaises(PolicyValidationError, HealthQueryParser.parse, [{"maxResults": [10]}])
+
+        self.assertRaises(PolicyValidationError, HealthQueryParser.parse, [
+            {"maxResults": 10}, {"maxResults": 20}])
+
+        self.assertRaises(PolicyValidationError, HealthQueryParser.parse, [{"tag:Test": "True"}])
+
+        self.assertRaises(PolicyValidationError, HealthQueryParser.parse, [{"regions": None}])
+
+        self.assertRaises(PolicyValidationError, HealthQueryParser.parse, [{"foo": "bar"}])
+
+        self.assertRaises(PolicyValidationError, HealthQueryParser.parse, [
+            {"too": "many", "keys": "error"}])
+
+        self.assertRaises(PolicyValidationError, HealthQueryParser.parse, ["Not a dictionary"])
+
+        self.assertRaises(PolicyValidationError, HealthQueryParser.parse, {
+            'event-status-codes': ['open', 'upcoming']})
+
+        self.assertRaises(PolicyValidationError, HealthQueryParser.parse, {
+            'eventStatusCodes': ['done']})

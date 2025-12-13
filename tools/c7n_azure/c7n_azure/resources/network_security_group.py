@@ -1,44 +1,107 @@
-# Copyright 2018 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 
 import uuid
-
-from c7n.actions import BaseAction
-from c7n.filters import Filter, FilterValidationError
-from c7n.filters.core import PolicyValidationError
-from c7n.utils import type_schema
 
 from c7n_azure.provider import resources
 from c7n_azure.resources.arm import ArmResourceManager
 from c7n_azure.utils import StringUtils, PortsRangeHelper
+from azure.core.exceptions import AzureError
 
-from msrestazure.azure_exceptions import CloudError
+from c7n.actions import BaseAction
+from c7n.filters import Filter, FilterValidationError
+from c7n.filters.core import PolicyValidationError, ValueFilter
+from c7n.utils import type_schema
+
+from msrestazure.tools import parse_resource_id
 
 
 @resources.register('networksecuritygroup')
 class NetworkSecurityGroup(ArmResourceManager):
-    class resource_type(object):
+    """Network Security Group Resource
+
+    :example:
+
+    This policy will deny access to all ports that are NOT 22, 23 or 24
+    for all Network Security Groups
+
+    .. code-block:: yaml
+
+          policies:
+           - name: close-inbound-except-22-24
+             resource: azure.networksecuritygroup
+             filters:
+              - type: ingress
+                exceptPorts: '22-24'
+                match: 'any'
+                access: 'Allow'
+             actions:
+              - type: close
+                exceptPorts: '22-24'
+                direction: 'Inbound'
+
+    :example:
+
+    This policy will find all NSGs with port 80 opened and port 443 closed,
+    then it will open port 443
+
+    .. code-block:: yaml
+
+         policies:
+           - name: close-egress-except-TCP
+             resource: azure.networksecuritygroup
+             filters:
+              - type: ingress
+                ports: '80'
+                access: 'Allow'
+              - type: ingress
+                ports: '443'
+                access: 'Deny'
+             actions:
+              - type: open
+                ports: '443'
+
+
+    :example:
+
+    This policy will find all NSGs with port 22 opened from 'Any' source
+
+    .. code-block:: yaml
+
+         policies:
+           - name: find-ingress-SSH-from-any-source
+             resource: azure.networksecuritygroup
+             filters:
+              - type: ingress
+                ports: '22'
+                access: 'Allow'
+                source: '*'
+
+
+    :example:
+
+    This policy will find all NSGs with port 8080 enabled to 'Any' destination
+
+    .. code-block:: yaml
+
+         policies:
+           - name: find-egress-HTTP-to-any-destination
+             resource: azure.networksecuritygroup
+             filters:
+              - type: egress
+                ports: '8080'
+                access: 'Allow'
+                destination: '*'
+
+    """
+
+    class resource_type(ArmResourceManager.resource_type):
+        doc_groups = ['Networking']
+
         service = 'azure.mgmt.network'
         client = 'NetworkManagementClient'
         enum_spec = ('network_security_groups', 'list_all', None)
-        id = 'id'
-        name = 'name'
-        default_report_fields = (
-            'name',
-            'location',
-            'resourceGroup'
-        )
+        resource_type = 'Microsoft.Network/networkSecurityGroups'
 
 
 DIRECTION = 'direction'
@@ -47,11 +110,17 @@ MATCH = 'match'
 EXCEPT_PORTS = 'exceptPorts'
 IP_PROTOCOL = 'ipProtocol'
 ACCESS = 'access'
+PREFIX = 'prefix'
 
 ALLOW_OPERATION = 'Allow'
 DENY_OPERATION = 'Deny'
 
 PRIORITY_STEP = 10
+
+SOURCE = 'source'
+DESTINATION = 'destination'
+
+CIDR = 'Cidr'
 
 
 class NetworkSecurityGroupFilter(Filter):
@@ -66,8 +135,11 @@ class NetworkSecurityGroupFilter(Filter):
             MATCH: {'type': 'string', 'enum': ['all', 'any']},
             PORTS: {'type': 'string'},
             EXCEPT_PORTS: {'type': 'string'},
-            IP_PROTOCOL: {'type': 'string', 'enum': ['TCP', 'UDP', '*']},
+            IP_PROTOCOL: {'type': 'string', 'enum': ['ICMP', 'TCP', 'UDP', '*']},
             ACCESS: {'type': 'string', 'enum': [ALLOW_OPERATION, DENY_OPERATION]},
+            SOURCE: {'type': 'string'},
+            DESTINATION: {'type': 'string'},
+            CIDR: {}
         },
         'required': ['type', ACCESS]
     }
@@ -85,6 +157,8 @@ class NetworkSecurityGroupFilter(Filter):
         return True
 
     def process(self, network_security_groups, event=None):
+        # List of NSG matching the policies, to return
+        matched = []
         # Get variables
         self.ip_protocol = self.data.get(IP_PROTOCOL, '*')
         self.IsAllowed = StringUtils.equal(self.data.get(ACCESS), ALLOW_OPERATION)
@@ -96,12 +170,78 @@ class NetworkSecurityGroupFilter(Filter):
         ports_set = PortsRangeHelper.get_ports_set_from_string(self.data.get(PORTS, '0-65535'))
         except_set = PortsRangeHelper.get_ports_set_from_string(self.data.get(EXCEPT_PORTS, ''))
         self.ports = ports_set.difference(except_set)
+        self.source_address = self.data.get(SOURCE, None)
+        self.destination_address = self.data.get(DESTINATION, None)
 
-        nsgs = [nsg for nsg in network_security_groups if self._check_nsg(nsg)]
-        return nsgs
+        match_op = self.data.get('match-operator', 'and') == 'and' and all or any
+        matching_nsg = {}
+        for nsg in network_security_groups:
+            matching_nsg['check_nsg'] = self._check_nsg(nsg)
+            if self.data.get(CIDR):
+                matching_nsg['check_cidr'] = False
+
+                permissions_to_expand = []
+                for security_rule in nsg['properties']['securityRules']:
+                    if security_rule['properties']['direction'] == self.direction_key:
+                        permissions_to_expand.append(security_rule['properties'])
+                for perm in self.expand_permissions(permissions_to_expand):
+                    if self._process_cidrs(perm):
+                        matching_nsg['check_cidr'] = True
+            matching_nsg_values = list(filter(
+                    lambda x: x is not None, matching_nsg.values()))
+
+            if match_op == all and not matching_nsg_values:
+                continue
+
+            match = match_op(matching_nsg_values)
+            if match:
+                matched.append(nsg)
+        return matched
+
+    def expand_permissions(self, permissions):
+        for p in permissions:
+            yield dict(p)
+
+    def _process_cidr(self, cidr_key, cidr_type, range_type, perm):
+        found = None
+        access_perms = self.data.get(ACCESS)
+        if perm['access'] != access_perms:
+            return False
+
+        ip_perms = perm.get(range_type, [])
+        if not ip_perms:
+            return False
+
+        if ip_perms.lower() == "internet":
+            return False
+
+        match_range = self.data[cidr_key]
+
+        if isinstance(match_range, dict):
+            match_range['key'] = cidr_type
+        else:
+            match_range = {cidr_type: match_range}
+
+        vf = ValueFilter(match_range, self.manager)
+        vf.annotate = False
+
+        found = vf({cidr_type: ip_perms})
+        return found
+
+    def _process_cidrs(self, perm):
+        found_v4 = False
+        if 'Cidr' in self.data:
+            found_v4 = self._process_cidr(
+                'Cidr',
+                'CidrIp',
+                f"{self.data['Cidr']['ipType'].lower()}AddressPrefix",
+                perm)
+        return found_v4
 
     def _check_nsg(self, nsg):
-        nsg_ports = PortsRangeHelper.build_ports_dict(nsg, self.direction_key, self.ip_protocol)
+        nsg_ports = PortsRangeHelper.build_ports_dict(nsg, self.direction_key, self.ip_protocol,
+                                                      self.source_address,
+                                                      self.destination_address)
 
         num_allow_ports = len([p for p in self.ports if nsg_ports.get(p)])
         num_deny_ports = len(self.ports) - num_allow_ports
@@ -130,6 +270,60 @@ class EgressFilter(NetworkSecurityGroupFilter):
     schema = type_schema('egress', rinherit=NetworkSecurityGroupFilter.schema)
 
 
+@NetworkSecurityGroup.filter_registry.register('flow-logs')
+class FlowLogs(ValueFilter):
+    """Filter a Network Security Group by its associated flow logs. NOTE: only one flow log
+    can be assigned to a Network Security Group, but to maintain parity with the Azure API, a list
+    of flow logs is returned to the filter.
+
+    :example:
+
+    Find all network security groups with a flow-log retention less than 90 days
+
+    .. code-block:: yaml
+
+        policies:
+          - name: flow-logs
+            resource: azure.networksecuritygroup
+            filters:
+              - or:
+                - type: flow-logs
+                  key: logs
+                  value: empty
+                - type: flow-logs
+                  key: logs[0].retentionPolicy.days
+                  op: lt
+                  value: 90
+    """
+
+    schema = type_schema('flow-logs', rinherit=ValueFilter.schema)
+
+    def _get_flow_logs(self, resource):
+        parsed_ids = [
+            parse_resource_id(log['id'])
+            for log in resource['properties'].get('flowLogs', [])
+        ]
+
+        client = self.manager.get_client()
+
+        return [
+            client.flow_logs.get(
+                parsed_id['resource_group'],
+                parsed_id['name'],
+                parsed_id['resource_name']
+            ).serialize(True).get('properties')
+            for parsed_id in parsed_ids
+        ]
+
+    def __call__(self, resource):
+        key = 'c7n:flow-logs'
+
+        if key not in resource['properties']:
+            resource['properties'][key] = {'logs': self._get_flow_logs(resource)}
+
+        return super().__call__(resource['properties'][key])
+
+
 class NetworkSecurityGroupPortsAction(BaseAction):
     """
     Action to perform on Network Security Groups
@@ -141,8 +335,9 @@ class NetworkSecurityGroupPortsAction(BaseAction):
             'type': {'enum': []},
             PORTS: {'type': 'string'},
             EXCEPT_PORTS: {'type': 'string'},
-            IP_PROTOCOL: {'type': 'string', 'enum': ['TCP', 'UDP', '*']},
-            DIRECTION: {'type': 'string', 'enum': ['Inbound', 'Outbound']}
+            IP_PROTOCOL: {'type': 'string', 'enum': ['ICMP', 'TCP', 'UDP', '*']},
+            DIRECTION: {'type': 'string', 'enum': ['Inbound', 'Outbound']},
+            PREFIX: {'type': 'string', 'maxLength': 44}  # 80 symbols limit, guid takes 36
         },
         'required': ['type', DIRECTION]
     }
@@ -173,6 +368,7 @@ class NetworkSecurityGroupPortsAction(BaseAction):
 
         ip_protocol = self.data.get(IP_PROTOCOL, '*')
         direction = self.data[DIRECTION]
+        prefix = self.data.get(PREFIX, 'c7n-policy-')
         # Build a list of ports described in the action.
         ports = PortsRangeHelper.get_ports_set_from_string(self.data.get(PORTS, '0-65535'))
         except_ports = PortsRangeHelper.get_ports_set_from_string(self.data.get(EXCEPT_PORTS, ''))
@@ -198,7 +394,7 @@ class NetworkSecurityGroupPortsAction(BaseAction):
             lowest_priority = rules[0]['properties']['priority'] if len(rules) > 0 else 4096
 
             # Create new top-priority rule to allow/block ports from the action.
-            rule_name = 'c7n-policy-' + str(uuid.uuid1())
+            rule_name = prefix + str(uuid.uuid1())
             new_rule = {
                 'name': rule_name,
                 'properties': {
@@ -216,13 +412,13 @@ class NetworkSecurityGroupPortsAction(BaseAction):
                                   nsg_name, self.access_action, ports)
 
             try:
-                self.manager.get_client().security_rules.create_or_update(
+                self.manager.get_client().security_rules.begin_create_or_update(
                     resource_group,
                     nsg_name,
                     rule_name,
                     new_rule
                 )
-            except CloudError as e:
+            except AzureError as e:
                 self.manager.log.error('Failed to create or update security rule for %s NSG.',
                                        nsg_name)
                 self.manager.log.error(e)

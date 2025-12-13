@@ -1,44 +1,42 @@
-# Copyright 2016-2017 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 import json
 
 from c7n.actions import RemovePolicyBase, ModifyPolicyBase, BaseAction
-from c7n.filters import CrossAccountAccessFilter, PolicyChecker
+from c7n.filters import CrossAccountAccessFilter, PolicyChecker, ValueFilter, MetricsFilter
 from c7n.filters.kms import KmsRelatedFilter
+import c7n.filters.policystatement as polstmt_filter
 from c7n.manager import resources
-from c7n.query import QueryResourceManager
+from c7n.query import ConfigSource, DescribeSource, QueryResourceManager, TypeInfo
 from c7n.resolver import ValuesFrom
 from c7n.utils import local_session, type_schema
+from c7n.tags import RemoveTag, Tag, TagDelayedAction, TagActionFilter, universal_augment
+from c7n.filters.related import RelatedResourceFilter
+
+from c7n.resources.securityhub import PostFinding
+
+
+class DescribeTopic(DescribeSource):
+
+    def augment(self, resources):
+        resources = super().augment(resources)
+        return universal_augment(self.manager, resources)
 
 
 @resources.register('sns')
 class SNS(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'sns'
-        type = 'topic'
+        arn_type = ''
+        arn_service = 'sns'
         enum_spec = ('list_topics', 'Topics', None)
         detail_spec = (
             'get_topic_attributes', 'TopicArn', 'TopicArn', 'Attributes')
         id = 'TopicArn'
-        filter_name = None
-        filter_type = None
         name = 'DisplayName'
-        date = None
         dimension = 'TopicName'
+        cfn_type = config_type = 'AWS::SNS::Topic'
         default_report_fields = (
             'TopicArn',
             'DisplayName',
@@ -46,6 +44,121 @@ class SNS(QueryResourceManager):
             'SubscriptionsPending',
             'SubscriptionsDeleted'
         )
+        universal_taggable = True
+        permissions_augment = ("sns:ListTagsForResource",)
+
+    permissions = ('sns:ListTagsForResource',)
+    source_mapping = {
+        'describe': DescribeTopic,
+        'config': ConfigSource
+    }
+
+
+SNS.filter_registry.register('marked-for-op', TagActionFilter)
+
+
+@SNS.action_registry.register('post-finding')
+class SNSPostFinding(PostFinding):
+
+    resource_type = 'AwsSnsTopic'
+
+    def format_resource(self, r):
+        envelope, payload = self.format_envelope(r)
+        payload.update(
+            self.filter_empty({
+                'KmsMasterKeyId': r.get('KmsMasterKeyId'),
+                'Owner': r['Owner'],
+                'TopicName': r['TopicArn'].rsplit(':', 1)[-1]}))
+        return envelope
+
+
+@SNS.filter_registry.register('has-statement')
+class HasStatementFilter(polstmt_filter.HasStatementFilter):
+    def get_std_format_args(self, topic):
+        return {
+            'topic_arn': topic['TopicArn'],
+            'account_id': self.manager.config.account_id,
+            'region': self.manager.config.region
+        }
+
+
+@SNS.action_registry.register('tag')
+class TagTopic(Tag):
+    """Action to create tag(s) on sns
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: tag-sns
+                resource: sns
+                filters:
+                  - "tag:target-tag": absent
+                actions:
+                  - type: tag
+                    key: target-tag
+                    value: target-tag-value
+    """
+
+    permissions = ('sns:TagResource',)
+
+    def process_resource_set(self, client, resources, new_tags):
+        for r in resources:
+            try:
+                client.tag_resource(
+                    ResourceArn=r['TopicArn'],
+                    Tags=new_tags)
+            except client.exceptions.ResourceNotFound:
+                continue
+
+
+@SNS.action_registry.register('remove-tag')
+class UntagTopic(RemoveTag):
+    """Action to remove tag(s) on sns
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: sns-remove-tag
+                resource: sns
+                filters:
+                  - "tag:OutdatedTag": present
+                actions:
+                  - type: remove-tag
+                    tags: ["OutdatedTag"]
+    """
+
+    permissions = ('sns:UntagResource',)
+
+    def process_resource_set(self, client, resources, tags):
+        for r in resources:
+            try:
+                client.untag_resource(ResourceArn=r['TopicArn'], TagKeys=tags)
+            except client.exceptions.ResourceNotFound:
+                continue
+
+
+@SNS.action_registry.register('mark-for-op')
+class MarkTopicForOp(TagDelayedAction):
+    """Mark SNS for deferred action
+
+    :example:
+
+    .. code-block:: yaml
+
+        policies:
+          - name: sns-invalid-tag-mark
+            resource: sns
+            filters:
+              - "tag:InvalidTag": present
+            actions:
+              - type: mark-for-op
+                op: delete
+                days: 1
+    """
 
 
 class SNSPolicyChecker(PolicyChecker):
@@ -159,7 +272,7 @@ class RemovePolicyStatement(RemovePolicyBase):
     .. code-block:: yaml
 
            policies:
-              - name: sns-cross-account
+              - name: remove-sns-cross-account
                 resource: sns
                 filters:
                   - type: cross-account
@@ -187,7 +300,7 @@ class RemovePolicyStatement(RemovePolicyBase):
             return
 
         p = json.loads(resource['Policy'])
-        statements, found = self.process_policy(
+        _, found = self.process_policy(
             p, resource, CrossAccountAccessFilter.annotation_key)
 
         if not found:
@@ -205,22 +318,6 @@ class RemovePolicyStatement(RemovePolicyBase):
 
 @SNS.action_registry.register('modify-policy')
 class ModifyPolicyStatement(ModifyPolicyBase):
-    """Action to modify policy statements from SNS
-
-    :example:
-
-    .. code-block:: yaml
-
-           policies:
-              - name: sns-cross-account
-                resource: sns
-                filters:
-                  - type: cross-account
-                actions:
-                  - type: modify-policy
-                    add-statements: [statement]
-                    remove-statements: [statement_id] or * or 'matched'
-    """
 
     permissions = ('sns:SetTopicAttributes', 'sns:GetTopicAttributes')
 
@@ -237,7 +334,7 @@ class ModifyPolicyStatement(ModifyPolicyBase):
                 new_policy = policy_statements
             new_policy, added = self.add_statements(new_policy)
 
-            if not removed or not added:
+            if not removed and not added:
                 continue
 
             results += {
@@ -279,21 +376,21 @@ class SetEncryption(BaseAction):
               actions:
                 - type: set-encryption
                   key: alias/cmk/key
-                  enabled: True
+                  enabled: true
 
             - name: set-sns-topic-encryption-with-id
               resource: sns
               actions:
                 - type: set-encryption
                   key: abcdefgh-1234-1234-1234-123456789012
-                  enabled: True
+                  enabled: true
 
             - name: set-sns-topic-encryption-with-arn
               resource: sns
               actions:
                 - type: set-encryption
                   key: arn:aws:kms:us-west-1:123456789012:key/abcdefgh-1234-1234-1234-123456789012
-                  enabled: True
+                  enabled: true
     """
 
     schema = type_schema(
@@ -319,3 +416,166 @@ class SetEncryption(BaseAction):
                 AttributeValue=key
             )
         return resources
+
+
+@SNS.action_registry.register('delete')
+class DeleteTopic(BaseAction):
+    """
+    Deletes a SNS Topic
+
+    :example:
+
+    .. code-block:: yaml
+
+      policies:
+        - name: delete-bad-topic
+          resource: aws.sns
+          filters:
+            - TopicArn: arn:aws:sns:us-east-2:123456789012:BadTopic
+          actions:
+            - type: delete
+    """
+
+    schema = type_schema('delete')
+
+    permissions = ('sns:DeleteTopic',)
+
+    def process(self, resources):
+        client = local_session(self.manager.session_factory).client('sns')
+        for r in resources:
+            try:
+                client.delete_topic(TopicArn=r['TopicArn'])
+            except client.exceptions.NotFoundException:
+                continue
+
+
+@SNS.filter_registry.register('metrics')
+class Metrics(MetricsFilter):
+
+    def get_dimensions(self, resource):
+        return [{'Name': self.model.dimension,
+                 'Value': resource['TopicArn'].rsplit(':', 1)[-1]}]
+
+
+class DescribeSubscription(DescribeSource):
+
+    def get_resources(self, resource_ids):
+        """Get resource details one at a time rather than client filter of all.
+
+        The list_subscriptions call has no way to provide a server side filter,
+        so the default implementation will fetch all subscriptions and then filter
+        client side. This is a problem if there are millions of resources (which
+        we have seen).
+        """
+        client = local_session(self.manager.session_factory).client('sns')
+        resources = []
+        for r_id in resource_ids:
+            try:
+                result = self.manager.retry(
+                    client.get_subscription_attributes, SubscriptionArn=r_id
+                )
+            except client.exceptions.NotFoundException:
+                continue
+            attributes = result.pop('Attributes')
+            resources.append(attributes)
+        return resources
+
+
+@resources.register('sns-subscription')
+class SNSSubscription(QueryResourceManager):
+
+    class resource_type(TypeInfo):
+        service = 'sns'
+        enum_spec = ('list_subscriptions', 'Subscriptions', None)
+        id = name = dimension = 'SubscriptionArn'
+        arn = 'SubscriptionArn'
+        cfn_type = 'AWS::SNS::Subscription'
+        default_report_fields = (
+            'SubscriptionArn',
+            'Owner',
+            'Protocol',
+            'Endpoint',
+            'TopicArn'
+        )
+        permissions_augment = ("sns:GetSubscriptionAttributes",)
+
+    source_mapping = {
+        'describe': DescribeSubscription,
+        'config': ConfigSource,
+    }
+
+
+@SNSSubscription.filter_registry.register('topic')
+class SNSSubscriptionTopic(RelatedResourceFilter):
+
+    """
+    Filters subscriptons based on topic properties
+
+    :example:
+
+    Identify subscriptions pointing to a topic that no longer
+    exists. Note that this policy also ensures that the topic
+    is in the same account and region. For cross-account
+    subscriptions, Custodian can't see if the topics still
+    exist.
+
+    .. code-block:: yaml
+
+            policies:
+              - name: sns-subscription-topic
+                resource: sns-subscription
+                filters:
+                  - type: value
+                    key: TopicArn
+                    op: glob
+                    value: "arn:aws:sns:{region}:{account_id}:*"
+                  - type: topic
+                    key: TopicArn
+                    value: absent
+    """
+
+    RelatedResource = 'c7n.resources.sns.SNS'
+    RelatedIdsExpression = 'TopicArn'
+    AnnotationKey = 'Topic'
+
+    schema = type_schema(
+        'topic', rinherit=ValueFilter.schema)
+
+
+@SNSSubscription.action_registry.register('delete')
+class SubscriptionDeleteAction(BaseAction):
+    """
+    Action to delete a subscription
+
+    :example:
+
+    .. code-block:: yaml
+
+        policies:
+          - name: external-owner-delete
+            resource: sns-subscription
+            filters:
+              - type: value
+                key: "Owner"
+                value: "{account_id}"
+                op: ne
+            actions:
+              - type: delete
+    """
+
+    schema = type_schema('delete')
+    permissions = ("sns:Unsubscribe",)
+
+    def process(self, subscriptions):
+        client = local_session(
+            self.manager.session_factory).client(self.manager.get_model().service)
+
+        for s in subscriptions:
+            self.process_subscription(client, s)
+
+    def process_subscription(self, client, subscription):
+        # Can't delete a pending subscription
+        if subscription['SubscriptionArn'] != 'PendingConfirmation':
+            self.manager.retry(
+                client.unsubscribe, SubscriptionArn=subscription['SubscriptionArn'],
+                ignore_err_codes=('NotFoundException',))

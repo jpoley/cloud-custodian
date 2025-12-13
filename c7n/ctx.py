@@ -1,18 +1,5 @@
-# Copyright 2015-2018 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 import time
 import uuid
 import os
@@ -24,13 +11,14 @@ from c7n.output import (
     log_outputs,
     metrics_outputs,
     sys_stats_outputs,
-    tracer_outputs)
+    tracer_outputs,
+)
 
 from c7n.utils import reset_session_cache, dumps, local_session
 from c7n.version import version
 
 
-class ExecutionContext(object):
+class ExecutionContext:
     """Policy Execution Context."""
 
     def __init__(self, session_factory, policy, options):
@@ -43,11 +31,14 @@ class ExecutionContext(object):
         self.start_time = None
         self.execution_id = None
         self.output = None
+        self.logs = None
         self.api_stats = None
         self.sys_stats = None
 
         # A few tests patch on metrics flush
-        self.metrics = metrics_outputs.select(self.options.metrics_enabled, self)
+        # For backward compatibility, accept both 'metrics' and 'metrics_enabled' params (PR #4361)
+        metrics = self.options.metrics or self.options.metrics_enabled
+        self.metrics = metrics_outputs.select(metrics, self)
 
         # Tracer is wired into core filtering code / which is getting
         # invoked sans execution context entry in tests
@@ -59,7 +50,7 @@ class ExecutionContext(object):
 
         # Always do file/blob storage outputs
         self.output_logs = None
-        if not isinstance(self.logs, log_outputs['default']):
+        if not isinstance(self.logs, (log_outputs['default'], log_outputs['null'])):
             self.output_logs = log_outputs.select(None, self)
 
         # Look for customizations, but fallback to default
@@ -101,8 +92,7 @@ class ExecutionContext(object):
     def __exit__(self, exc_type=None, exc_value=None, exc_traceback=None):
         if exc_type is not None and self.metrics:
             self.metrics.put_metric('PolicyException', 1, "Count")
-        self.policy._write_file(
-            'metadata.json', dumps(self.get_metadata(), indent=2))
+        self.output.write_file('metadata.json', dumps(self.get_metadata(), indent=2))
         self.api_stats.__exit__(exc_type, exc_value, exc_traceback)
 
         with self.tracer.subsegment('output'):
@@ -131,8 +121,9 @@ class ExecutionContext(object):
                 'id': self.execution_id,
                 'start': self.start_time,
                 'end_time': t,
-                'duration': t - self.start_time},
-            'config': dict(self.options)
+                'duration': t - self.start_time,
+            },
+            'config': dict(self.options),
         }
 
         if 'sys-stats' in include and self.sys_stats:

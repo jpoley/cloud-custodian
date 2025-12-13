@@ -1,4 +1,4 @@
-# Cloud watch log exporter
+# c7n-log-exporter: Cloud watch log exporter automation
 
 A small serverless app to archive cloud logs across accounts to an archive bucket. It utilizes
 cloud log export to s3 feature for historical exports.
@@ -28,7 +28,7 @@ as the periodic historical exports.
  - Catch up archiving is not run in lambda (do a cli run first)
 
 
-# Cli usage
+## Cli usage
 
 ```
 make install
@@ -44,6 +44,8 @@ c7n-log-exporter export --help
 To ease usage when running across multiple accounts, a config file can be specified, as
 an example.
 
+### Using S3 Bucket as destination
+
 ```
 destination:
   bucket: custodian-log-archive
@@ -51,6 +53,30 @@ destination:
 
 accounts:
   - name: custodian-demo
+    role: "arn:aws:iam::111111111111:role/CloudCustodianRole"
+    groups:
+      - "/aws/lambda/*"
+      - "vpc-flow-logs"
+```
+
+### Using CloudWatch Destination as destination cross account
+The Cloudwatch Destination needs setup in account and access policy set on CloudWatch Destination to to allow 
+source account access to the Cloudwatch Destination
+
+```
+subscription:
+  destination-arn: "arn:aws:logs:us-east-1:111111111111:destination:CustodianCWLogsDestination"
+  destination-role: "arn:aws:iam::111111111111:role/CWLtoKinesisRole"
+  name: "CustodianCWLogsDestination"
+
+destination:
+  bucket: custodian-log-archive
+  prefix: logs2
+
+accounts:
+  - name: custodian-demo
+    # https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CreateSubscriptionFilter-IAMrole.html
+    subscription-role: "arn:aws:iam::111111111111:role/<role-name>"
     role: "arn:aws:iam::111111111111:role/CloudCustodianRole"
     groups:
       - "/aws/lambda/*"
@@ -66,7 +92,7 @@ accounts and log groups.
 c7n-log-exporter run --config config.yml
 ```
 
-# Serverless Usage
+## Serverless Usage
 
 Edit config.yml to specify the accounts, archive bucket, and log groups you want to
 use.

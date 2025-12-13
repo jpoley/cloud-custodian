@@ -1,82 +1,54 @@
-# Copyright 2016-2017 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
-import functools
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 import json
-import logging
 import itertools
 
 from botocore.exceptions import ClientError
 from concurrent.futures import as_completed
 
-from c7n.actions import ActionRegistry, BaseAction, ModifyVpcSecurityGroupsAction
+from c7n.actions import BaseAction, ModifyVpcSecurityGroupsAction
 from c7n.exceptions import PolicyValidationError
 from c7n.filters import (
-    FilterRegistry, ValueFilter, DefaultVpcBase, AgeFilter, OPERATORS,
-    CrossAccountAccessFilter)
+    ValueFilter, AgeFilter, CrossAccountAccessFilter, Filter)
 import c7n.filters.vpc as net_filters
-
+from c7n.filters.kms import KmsRelatedFilter
+from c7n.filters.offhours import OffHour, OnHour
 from c7n.manager import resources
 from c7n.resolver import ValuesFrom
-from c7n.query import QueryResourceManager
+from c7n.query import QueryResourceManager, TypeInfo, RetryPageIterator
 from c7n import tags
 from c7n.utils import (
-    type_schema, local_session, chunks, generate_arn, get_retry,
-    snapshot_identifier)
-
-log = logging.getLogger('custodian.redshift')
-
-filters = FilterRegistry('redshift.filters')
-actions = ActionRegistry('redshift.actions')
-filters.register('marked-for-op', tags.TagActionFilter)
+    type_schema, local_session, chunks, snapshot_identifier, jmespath_search)
+from .aws import shape_validate
+from datetime import datetime, timedelta
+from c7n.filters.backup import ConsecutiveAwsBackupsFilter
 
 
 @resources.register('redshift')
 class Redshift(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'redshift'
-        type = 'cluster'
+        arn_type = 'cluster'
+        arn_separator = ":"
         enum_spec = ('describe_clusters', 'Clusters', None)
-        detail_spec = None
         name = id = 'ClusterIdentifier'
         filter_name = 'ClusterIdentifier'
         filter_type = 'scalar'
         date = 'ClusterCreateTime'
         dimension = 'ClusterIdentifier'
-        config_type = "AWS::Redshift::Cluster"
-
-    filter_registry = filters
-    action_registry = actions
-    retry = staticmethod(get_retry(('Throttling',)))
-
-    permissions = ('iam:ListRoles',)  # account id retrieval
-    _generate_arn = None
-
-    @property
-    def generate_arn(self):
-        if self._generate_arn is None:
-            self._generate_arn = functools.partial(
-                generate_arn, 'redshift', region=self.config.region,
-                account_id=self.account_id, resource_type='cluster',
-                separator=':')
-        return self._generate_arn
+        cfn_type = config_type = "AWS::Redshift::Cluster"
 
 
-@filters.register('default-vpc')
-class DefaultVpc(DefaultVpcBase):
+Redshift.filter_registry.register('marked-for-op', tags.TagActionFilter)
+Redshift.filter_registry.register('network-location', net_filters.NetworkLocation)
+Redshift.filter_registry.register('offhour', OffHour)
+Redshift.filter_registry.register('onhour', OnHour)
+Redshift.filter_registry.register('consecutive-aws-backups', ConsecutiveAwsBackupsFilter)
+
+
+@Redshift.filter_registry.register('default-vpc')
+class DefaultVpc(net_filters.DefaultVpcBase):
     """ Matches if an redshift database is in the default vpc
 
     :example:
@@ -97,13 +69,160 @@ class DefaultVpc(DefaultVpcBase):
                 self.match(redshift.get('VpcId')) or False)
 
 
-@filters.register('security-group')
+@Redshift.filter_registry.register('logging')
+class LoggingFilter(ValueFilter):
+    """ Checks Redshift logging status and attributes.
+
+    :example:
+
+    .. code-block:: yaml
+
+
+            policies:
+
+                - name: redshift-logging-bucket-and-prefix-test
+                  resource: redshift
+                  filters:
+                   - type: logging
+                     key: LoggingEnabled
+                     value: true
+                   - type: logging
+                     key: S3KeyPrefix
+                     value: "accounts/{account_id}"
+                   - type: logging
+                     key: BucketName
+                     value: "redshiftlogs"
+
+
+    """
+    permissions = ("redshift:DescribeLoggingStatus",)
+    schema = type_schema('logging', rinherit=ValueFilter.schema)
+    annotation_key = 'c7n:logging'
+
+    def process(self, clusters, event=None):
+        client = local_session(self.manager.session_factory).client('redshift')
+        results = []
+        for cluster in clusters:
+            if self.annotation_key not in cluster:
+                try:
+                    result = client.describe_logging_status(
+                        ClusterIdentifier=cluster['ClusterIdentifier'])
+                    result.pop('ResponseMetadata')
+                except client.exceptions.ClusterNotFound:
+                    continue
+                cluster[self.annotation_key] = result
+
+            if self.match(cluster[self.annotation_key]):
+                results.append(cluster)
+        return results
+
+
+@Redshift.action_registry.register('pause')
+class Pause(BaseAction):
+
+    schema = type_schema('pause')
+    permissions = ('redshift:PauseCluster',)
+
+    def process(self, resources):
+        client = local_session(
+            self.manager.session_factory).client('redshift')
+        for r in self.filter_resources(resources, 'ClusterStatus', ('available',)):
+            try:
+                client.pause_cluster(
+                    ClusterIdentifier=r['ClusterIdentifier'])
+            except (client.exceptions.ClusterNotFoundFault,
+                    client.exceptions.InvalidClusterStateFault):
+                raise
+
+
+@Redshift.action_registry.register('resume')
+class Resume(BaseAction):
+
+    schema = type_schema('resume')
+    permissions = ('redshift:ResumeCluster',)
+
+    def process(self, resources):
+        client = local_session(
+            self.manager.session_factory).client('redshift')
+        for r in self.filter_resources(resources, 'ClusterStatus', ('paused',)):
+            try:
+                client.resume_cluster(
+                    ClusterIdentifier=r['ClusterIdentifier'])
+            except (client.exceptions.ClusterNotFoundFault,
+                    client.exceptions.InvalidClusterStateFault):
+                raise
+
+
+@Redshift.action_registry.register('set-logging')
+class SetRedshiftLogging(BaseAction):
+    """Action to enable/disable Redshift logging for a Redshift Cluster.
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: redshift-test
+                resource: redshift
+                filters:
+                  - type: logging
+                    key: LoggingEnabled
+                    value: false
+                actions:
+                  - type: set-logging
+                    bucket: redshiftlogtest
+                    prefix: redshiftlogs
+                    state: enabled
+    """
+    schema = type_schema(
+        'set-logging',
+        state={'enum': ['enabled', 'disabled']},
+        bucket={'type': 'string'},
+        prefix={'type': 'string'},
+        required=('state',))
+
+    def get_permissions(self):
+        perms = ('redshift:EnableLogging',)
+        if self.data.get('state') == 'disabled':
+            return ('redshift:DisableLogging',)
+        return perms
+
+    def validate(self):
+        if self.data.get('state') == 'enabled':
+            if 'bucket' not in self.data:
+                raise PolicyValidationError((
+                    "redshift logging enablement requires `bucket` "
+                    "and `prefix` specification on %s" % (self.manager.data,)))
+        return self
+
+    def process(self, resources):
+        client = local_session(self.manager.session_factory).client('redshift')
+        for redshift in resources:
+            redshift_id = redshift['ClusterIdentifier']
+
+            if self.data.get('state') == 'enabled':
+
+                prefix = self.data.get('prefix')
+                bucketname = self.data.get('bucket')
+
+                self.manager.retry(
+                    client.enable_logging,
+                    ClusterIdentifier=redshift_id, BucketName=bucketname, S3KeyPrefix=prefix)
+
+            elif self.data.get('state') == 'disabled':
+
+                self.manager.retry(
+                    client.disable_logging,
+                    ClusterIdentifier=redshift_id)
+
+
+@Redshift.filter_registry.register('security-group')
 class SecurityGroupFilter(net_filters.SecurityGroupFilter):
 
     RelatedIdsExpression = "VpcSecurityGroups[].VpcSecurityGroupId"
 
 
-@filters.register('subnet')
+@Redshift.filter_registry.register('subnet')
 class SubnetFilter(net_filters.SubnetFilter):
 
     RelatedIdsExpression = ""
@@ -125,10 +244,7 @@ class SubnetFilter(net_filters.SubnetFilter):
         return super(SubnetFilter, self).process(resources, event)
 
 
-filters.register('network-location', net_filters.NetworkLocation)
-
-
-@filters.register('param')
+@Redshift.filter_registry.register('param')
 class Parameter(ValueFilter):
     """Filter redshift clusters based on parameter values
 
@@ -137,7 +253,7 @@ class Parameter(ValueFilter):
     .. code-block:: yaml
 
             policies:
-              - name: redshift-no-ssl
+              - name: redshift-param-ssl
                 resource: redshift
                 filters:
                   - type: param
@@ -147,6 +263,7 @@ class Parameter(ValueFilter):
     """
 
     schema = type_schema('param', rinherit=ValueFilter.schema)
+    schema_alias = False
     group_params = ()
 
     permissions = ("redshift:DescribeClusterParameters",)
@@ -185,7 +302,13 @@ class Parameter(ValueFilter):
         return self.match(params)
 
 
-@actions.register('delete')
+@Redshift.filter_registry.register('kms-key')
+class KmsFilter(KmsRelatedFilter):
+
+    RelatedIdsExpression = 'KmsKeyId'
+
+
+@Redshift.action_registry.register('delete')
 class Delete(BaseAction):
     """Action to delete a redshift cluster
 
@@ -246,7 +369,7 @@ class Delete(BaseAction):
                 raise
 
 
-@actions.register('retention')
+@Redshift.action_registry.register('retention')
 class RetentionWindow(BaseAction):
     """Action to set the snapshot retention period (in days)
 
@@ -303,7 +426,7 @@ class RetentionWindow(BaseAction):
             AutomatedSnapshotRetentionPeriod=retention)
 
 
-@actions.register('snapshot')
+@Redshift.action_registry.register('snapshot')
 class Snapshot(BaseAction):
     """Action to take a snapshot of a redshift cluster
 
@@ -351,7 +474,7 @@ class Snapshot(BaseAction):
             Tags=cluster_tags)
 
 
-@actions.register('enable-vpc-routing')
+@Redshift.action_registry.register('enable-vpc-routing')
 class EnhancedVpcRoutine(BaseAction):
     """Action to enable enhanced vpc routing on a redshift cluster
 
@@ -404,7 +527,7 @@ class EnhancedVpcRoutine(BaseAction):
                 EnhancedVpcRouting=new_routing)
 
 
-@actions.register('set-public-access')
+@Redshift.action_registry.register('set-public-access')
 class RedshiftSetPublicAccess(BaseAction):
     """
     Action to set the 'PubliclyAccessible' setting on a redshift cluster
@@ -445,7 +568,82 @@ class RedshiftSetPublicAccess(BaseAction):
         return clusters
 
 
-@actions.register('mark-for-op')
+@Redshift.action_registry.register('set-attributes')
+class RedshiftSetAttributes(BaseAction):
+    """
+    Action to modify Redshift clusters
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+                - name: redshift-modify-cluster
+                  resource: redshift
+                  filters:
+                    - type: value
+                      key: AllowVersionUpgrade
+                      value: false
+                  actions:
+                    - type: set-attributes
+                      attributes:
+                        AllowVersionUpgrade: true
+    """
+
+    schema = type_schema('set-attributes',
+                        attributes={"type": "object"},
+                        required=('attributes',))
+
+    permissions = ('redshift:ModifyCluster',)
+    cluster_mapping = {
+        'ElasticIp': 'ElasticIpStatus.ElasticIp',
+        'ClusterSecurityGroups': 'ClusterSecurityGroups[].ClusterSecurityGroupName',
+        'VpcSecurityGroupIds': 'VpcSecurityGroups[].ClusterSecurityGroupName',
+        'HsmClientCertificateIdentifier': 'HsmStatus.HsmClientCertificateIdentifier',
+        'HsmConfigurationIdentifier': 'HsmStatus.HsmConfigurationIdentifier'
+    }
+
+    shape = 'ModifyClusterMessage'
+
+    def validate(self):
+        attrs = dict(self.data.get('attributes'))
+        if attrs.get('ClusterIdentifier'):
+            raise PolicyValidationError('ClusterIdentifier field cannot be updated')
+        attrs["ClusterIdentifier"] = ""
+        return shape_validate(attrs, self.shape, 'redshift')
+
+    def process(self, clusters):
+        client = local_session(self.manager.session_factory).client(
+            self.manager.get_model().service)
+        for cluster in clusters:
+            self.process_cluster(client, cluster)
+
+    def process_cluster(self, client, cluster):
+        try:
+            config = dict(self.data.get('attributes'))
+            modify = {}
+            for k, v in config.items():
+                if ((k in self.cluster_mapping and
+                v != jmespath_search(self.cluster_mapping[k], cluster)) or
+                v != cluster.get('PendingModifiedValues', {}).get(k, cluster.get(k))):
+                    modify[k] = v
+            if not modify:
+                return
+
+            modify['ClusterIdentifier'] = (cluster.get('PendingModifiedValues', {})
+                                          .get('ClusterIdentifier')
+                                          or cluster.get('ClusterIdentifier'))
+            client.modify_cluster(**modify)
+        except (client.exceptions.ClusterNotFoundFault):
+            return
+        except ClientError as e:
+            self.log.warning(
+                "Exception trying to modify cluster: %s error: %s",
+                cluster['ClusterIdentifier'], e)
+            raise
+
+
+@Redshift.action_registry.register('mark-for-op')
 class TagDelayedAction(tags.TagDelayedAction):
     """Action to create an action to be performed at a later time
 
@@ -471,7 +669,7 @@ class TagDelayedAction(tags.TagDelayedAction):
     """
 
 
-@actions.register('tag')
+@Redshift.action_registry.register('tag')
 class Tag(tags.Tag):
     """Action to add tag/tags to a redshift cluster
 
@@ -495,13 +693,12 @@ class Tag(tags.Tag):
     permissions = ('redshift:CreateTags',)
 
     def process_resource_set(self, client, resources, tags):
-        for r in resources:
-            arn = self.manager.generate_arn(r['ClusterIdentifier'])
-            client.create_tags(ResourceName=arn, Tags=tags)
+        for rarn, r in zip(self.manager.get_arns(resources), resources):
+            client.create_tags(ResourceName=rarn, Tags=tags)
 
 
-@actions.register('unmark')
-@actions.register('remove-tag')
+@Redshift.action_registry.register('unmark')
+@Redshift.action_registry.register('remove-tag')
 class RemoveTag(tags.RemoveTag):
     """Action to remove tag/tags from a redshift cluster
 
@@ -524,12 +721,11 @@ class RemoveTag(tags.RemoveTag):
     permissions = ('redshift:DeleteTags',)
 
     def process_resource_set(self, client, resources, tag_keys):
-        for r in resources:
-            arn = self.manager.generate_arn(r['ClusterIdentifier'])
-            client.delete_tags(ResourceName=arn, TagKeys=tag_keys)
+        for rarn, r in zip(self.manager.get_arns(resources), resources):
+            client.delete_tags(ResourceName=rarn, TagKeys=tag_keys)
 
 
-@actions.register('tag-trim')
+@Redshift.action_registry.register('tag-trim')
 class TagTrim(tags.TagTrim):
     """Action to remove tags from a redshift cluster
 
@@ -544,8 +740,10 @@ class TagTrim(tags.TagTrim):
               - name: redshift-tag-trim
                 resource: redshift
                 filters:
-                  - type: tag-count
-                    count: 10
+                  - type: value
+                    key: "length(Tags)"
+                    op: ge
+                    value: 10
                 actions:
                   - type: tag-trim
                     space: 1
@@ -562,57 +760,7 @@ class TagTrim(tags.TagTrim):
         client.delete_tags(ResourceName=arn, TagKeys=candidates)
 
 
-@resources.register('redshift-subnet-group')
-class RedshiftSubnetGroup(QueryResourceManager):
-    """Redshift subnet group."""
-
-    class resource_type(object):
-        service = 'redshift'
-        type = 'redshift-subnet-group'
-        id = name = 'ClusterSubnetGroupName'
-        enum_spec = (
-            'describe_cluster_subnet_groups', 'ClusterSubnetGroups', None)
-        filter_name = 'ClusterSubnetGroupName'
-        filter_type = 'scalar'
-        dimension = None
-        date = None
-        config_type = "AWS::Redshift::ClusterSubnetGroup"
-
-
-@resources.register('redshift-snapshot')
-class RedshiftSnapshot(QueryResourceManager):
-    """Resource manager for Redshift snapshots.
-    """
-
-    filter_registry = FilterRegistry('redshift-snapshot.filters')
-    action_registry = ActionRegistry('redshift-snapshot.actions')
-
-    filter_registry.register('marked-for-op', tags.TagActionFilter)
-
-    _generate_arn = None
-
-    @property
-    def generate_arn(self):
-        if self._generate_arn is None:
-            self._generate_arn = functools.partial(
-                generate_arn, 'redshift', region=self.config.region,
-                account_id=self.account_id, resource_type='snapshot',
-                separator=':')
-        return self._generate_arn
-
-    class resource_type(object):
-        service = 'redshift'
-        type = 'redshift-snapshot'
-        enum_spec = ('describe_cluster_snapshots', 'Snapshots', None)
-        name = id = 'SnapshotIdentifier'
-        filter_name = None
-        filter_type = None
-        dimension = None
-        date = 'SnapshotCreateTime'
-        config_type = "AWS::Redshift::ClusterSnapshot"
-
-
-@actions.register('modify-security-groups')
+@Redshift.action_registry.register('modify-security-groups')
 class RedshiftModifyVpcSecurityGroups(ModifyVpcSecurityGroupsAction):
     """Modify security groups on a Redshift cluster"""
 
@@ -627,6 +775,45 @@ class RedshiftModifyVpcSecurityGroups(ModifyVpcSecurityGroupsAction):
             client.modify_cluster(
                 ClusterIdentifier=c['ClusterIdentifier'],
                 VpcSecurityGroupIds=groups[idx])
+
+
+@resources.register('redshift-subnet-group')
+class RedshiftSubnetGroup(QueryResourceManager):
+    """Redshift subnet group."""
+
+    class resource_type(TypeInfo):
+        service = 'redshift'
+        arn_type = 'subnetgroup'
+        arn_separator = ':'
+        id = name = 'ClusterSubnetGroupName'
+        enum_spec = (
+            'describe_cluster_subnet_groups', 'ClusterSubnetGroups', None)
+        filter_name = 'ClusterSubnetGroupName'
+        filter_type = 'scalar'
+        cfn_type = config_type = "AWS::Redshift::ClusterSubnetGroup"
+        universal_taggable = object()
+
+
+@resources.register('redshift-snapshot')
+class RedshiftSnapshot(QueryResourceManager):
+    """Resource manager for Redshift snapshots.
+    """
+
+    class resource_type(TypeInfo):
+        service = 'redshift'
+        arn_type = 'snapshot'
+        arn_separator = ':'
+        enum_spec = ('describe_cluster_snapshots', 'Snapshots', None)
+        name = id = 'SnapshotIdentifier'
+        date = 'SnapshotCreateTime'
+        config_type = "AWS::Redshift::ClusterSnapshot"
+        universal_taggable = True
+
+    def get_arns(self, resources):
+        arns = []
+        for r in resources:
+            arns.append(self.generate_arn(r['ClusterIdentifier'] + '/' + r[self.get_model().id]))
+        return arns
 
 
 @RedshiftSnapshot.filter_registry.register('age')
@@ -648,7 +835,7 @@ class RedshiftSnapshotAge(AgeFilter):
 
     schema = type_schema(
         'age', days={'type': 'number'},
-        op={'type': 'string', 'enum': list(OPERATORS.keys())})
+        op={'$ref': '#/definitions/filters_common/comparison_operators'})
 
     date_attribute = 'SnapshotCreateTime'
 
@@ -700,7 +887,7 @@ class RedshiftSnapshotDelete(BaseAction):
     permissions = ('redshift:DeleteClusterSnapshot',)
 
     def process(self, snapshots):
-        log.info("Deleting %d Redshift snapshots", len(snapshots))
+        self.log.info("Deleting %d Redshift snapshots", len(snapshots))
         with self.executor_factory(max_workers=3) as w:
             futures = []
             for snapshot_set in chunks(reversed(snapshots), size=50):
@@ -721,98 +908,13 @@ class RedshiftSnapshotDelete(BaseAction):
                 SnapshotClusterIdentifier=s['ClusterIdentifier'])
 
 
-@RedshiftSnapshot.action_registry.register('mark-for-op')
-class RedshiftSnapshotTagDelayedAction(tags.TagDelayedAction):
-    """Action to create a delayed actions to be performed on a redshift snapshot
-
-    :example:
-
-    .. code-block:: yaml
-
-            policies:
-              - name: redshift-snapshot-expiring
-                resource: redshift-snapshot
-                filters:
-                  - "tag:custodian_cleanup": absent
-                  - type: age
-                    days: 14
-                    op: eq
-                actions:
-                  - type: mark-for-op
-                    tag: custodian_cleanup
-                    msg: "Snapshot expiring: {op}@{action_date}"
-                    op: delete
-                    days: 7
-    """
-
-
-@RedshiftSnapshot.action_registry.register('tag')
-class RedshiftSnapshotTag(tags.Tag):
-    """Action to add tag/tags to a redshift snapshot
-
-    :example:
-
-    .. code-block:: yaml
-
-            policies:
-              - name: redshift-required-tags
-                resource: redshift-snapshot
-                filters:
-                  - "tag:RequiredTag1": absent
-                actions:
-                  - type: tag
-                    key: RequiredTag1
-                    value: RequiredValue1
-    """
-
-    concurrency = 2
-    batch_size = 5
-    permissions = ('redshift:CreateTags',)
-
-    def process_resource_set(self, client, resources, tags):
-        for r in resources:
-            arn = self.manager.generate_arn(
-                r['ClusterIdentifier'] + '/' + r['SnapshotIdentifier'])
-            client.create_tags(ResourceName=arn, Tags=tags)
-
-
-@RedshiftSnapshot.action_registry.register('unmark')
-@RedshiftSnapshot.action_registry.register('remove-tag')
-class RedshiftSnapshotRemoveTag(tags.RemoveTag):
-    """Action to remove tag/tags from a redshift snapshot
-
-    :example:
-
-    .. code-block:: yaml
-
-            policies:
-              - name: redshift-remove-tags
-                resource: redshift-snapshot
-                filters:
-                  - "tag:UnusedTag1": present
-                actions:
-                  - type: remove-tag
-                    tags: ["UnusedTag1"]
-    """
-
-    concurrency = 2
-    batch_size = 5
-    permissions = ('redshift:DeleteTags',)
-
-    def process_resource_set(self, client, resources, tag_keys):
-        for r in resources:
-            arn = self.manager.generate_arn(
-                r['ClusterIdentifier'] + '/' + r['SnapshotIdentifier'])
-            client.delete_tags(ResourceName=arn, TagKeys=tag_keys)
-
-
 @RedshiftSnapshot.action_registry.register('revoke-access')
 class RedshiftSnapshotRevokeAccess(BaseAction):
     """Revokes ability of accounts to restore a snapshot
 
     :example:
 
-        .. code-block: yaml
+        .. code-block:: yaml
 
             policies:
               - name: redshift-snapshot-revoke-access
@@ -863,3 +965,91 @@ class RedshiftSnapshotRevokeAccess(BaseAction):
                             ', '.join(
                                 [s['SnapshotIdentifier'] for s in futures[f]]),
                             f.exception()))
+
+
+@resources.register('redshift-reserved')
+class ReservedNode(QueryResourceManager):
+
+    class resource_type(TypeInfo):
+        service = 'redshift'
+        name = id = 'ReservedNodeId'
+        date = 'StartTime'
+        enum_spec = (
+            'describe_reserved_nodes', 'ReservedNodes', None)
+        filter_name = 'ReservedNodes'
+        filter_type = 'list'
+        arn_type = "reserved-nodes"
+        permissions_enum = ('redshift:DescribeReservedNodes',)
+
+
+@Redshift.filter_registry.register('consecutive-snapshots')
+class ClusterConsecutiveSnapshots(Filter):
+    """Returns Clusters where number of consective daily backups is
+    equal to/or greater than n days.
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: redshift-daily-snapshot-count
+                resource: redshift
+                filters:
+                  - type: consecutive-snapshots
+                    count: 7
+                    period: days
+                    status: available
+    """
+    schema = type_schema('consecutive-snapshots', count={'type': 'number', 'minimum': 1},
+        period={'enum': ['hours', 'days', 'weeks']},
+        status={'enum': ['available', 'creating', 'final snapshot', 'failed']},
+        required=['count', 'period', 'status'])
+    permissions = ('redshift:DescribeClusterSnapshots', 'redshift:DescribeClusters', )
+    annotation = 'c7n:RedshiftSnapshots'
+
+    def process_resource_set(self, client, resources, lbdate):
+        paginator = client.get_paginator('describe_cluster_snapshots')
+        paginator.PAGE_ITERATOR_CLS = RetryPageIterator
+        rs_snapshots = paginator.paginate(StartTime=lbdate).build_full_result().get(
+            'Snapshots', [])
+
+        cluster_map = {}
+        for snap in rs_snapshots:
+            cluster_map.setdefault(snap['ClusterIdentifier'], []).append(snap)
+        for r in resources:
+            r[self.annotation] = cluster_map.get(r['ClusterIdentifier'], [])
+
+    def get_date(self, time):
+        period = self.data.get('period')
+        if period == 'weeks':
+            date = (datetime.utcnow() - timedelta(weeks=time)).strftime('%Y-%m-%d')
+        elif period == 'hours':
+            date = (datetime.utcnow() - timedelta(hours=time)).strftime('%Y-%m-%d-%H')
+        else:
+            date = (datetime.utcnow() - timedelta(days=time)).strftime('%Y-%m-%d')
+        return date
+
+    def process(self, resources, event=None):
+        client = local_session(self.manager.session_factory).client('redshift')
+        results = []
+        retention = self.data.get('count')
+        lbdate = self.get_date(retention)
+        expected_dates = set()
+        for time in range(1, retention + 1):
+            expected_dates.add(self.get_date(time))
+
+        for resource_set in chunks(
+                [r for r in resources if self.annotation not in r], 50):
+            self.process_resource_set(client, resource_set, lbdate)
+
+        for r in resources:
+            snapshot_dates = set()
+            for snapshot in r[self.annotation]:
+                if snapshot['Status'] == self.data.get('status'):
+                    if self.data.get('period') == 'hours':
+                        snapshot_dates.add(snapshot['SnapshotCreateTime'].strftime('%Y-%m-%d-%H'))
+                    else:
+                        snapshot_dates.add(snapshot['SnapshotCreateTime'].strftime('%Y-%m-%d'))
+            if expected_dates.issubset(snapshot_dates):
+                results.append(r)
+        return results

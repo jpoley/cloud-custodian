@@ -1,27 +1,21 @@
-# Copyright 2016-2017 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 import json
 import os
 import sys
+import argparse
 
 from argparse import ArgumentTypeError
-from c7n import cli, version, commands
 from datetime import datetime, timedelta
 
+from c7n import cli, version, commands
+from c7n.resolver import ValuesFrom
 from c7n.resources import aws
+from c7n.schema import ElementSchema, generate
+from c7n.utils import yaml_dump, yaml_load
+from c7n.commands import LoadSessionPolicyJson
+
+import pytest
 from .common import BaseTest, TextTestIO
 
 
@@ -37,7 +31,7 @@ class CliTest(BaseTest):
 
     def get_output(self, argv):
         """ Run cli.main with the supplied argv and return the output. """
-        out, err = self.run_and_expect_success(argv)
+        out, _ = self.run_and_expect_success(argv)
         return out
 
     def capture_output(self):
@@ -101,12 +95,37 @@ class VersionTest(CliTest):
 
     def test_debug_version(self):
         output = self.get_output(["custodian", "version", "--debug"])
-        # Among other things, this should print sys.path
         self.assertIn(version.version, output)
-        self.assertIn(sys.path[0], output)
+        self.assertIn('botocore==', output)
+        self.assertIn('python-dateutil==', output)
+
+
+def check_left():
+    try:
+        import c7n_left  # noqa: F401
+    except ImportError:
+        return {"condition": True, "reason": "c7n_left not installed"}
+    return {"condition": False, "reason": "c7n_left installed"}
 
 
 class ValidateTest(CliTest):
+
+    def test_invalidate_structure_exit(self):
+        invalid_policies = {"policies": [{"name": "foo"}]}
+        yaml_file = self.write_policy_file(invalid_policies)
+        self.run_and_expect_failure(["custodian", "validate", yaml_file], 1)
+
+    @pytest.mark.skipif(**check_left())
+    def test_validate_terraform(self):
+        policies = {
+            "policies": [
+                {"name": "tfx",
+                 "resource": "terraform.*",
+                 "filters": ["taggable"]}
+            ]
+        }
+        yaml_file = self.write_policy_file(policies)
+        self.run_and_expect_success(["custodian", "validate", yaml_file])
 
     def test_validate(self):
         invalid_policies = {
@@ -158,13 +177,54 @@ class ValidateTest(CliTest):
         # duplicate policy names
         self.run_and_expect_failure(["custodian", "validate", yaml_file, yaml_file], 1)
 
+    def test_deprecated(self):
+
+        deprecated = {
+            "policies": [
+                {
+                    "name": "foo",
+                    "resource": "ec2",
+                    "filters": [{"tag:custodian_tagging": "not-null"}],
+                    "actions": [{"type": "unmark", "tags": ["custodian_cleanup"]}],
+                }
+            ]
+        }
+        yaml_file = self.write_policy_file(deprecated)
+
+        self.run_and_expect_success(["custodian", "validate", yaml_file])
+
+        # strict checking should fail as unmark is deprecated
+        self.run_and_expect_failure(["custodian", "validate", "--strict", yaml_file], 1)
+
 
 class SchemaTest(CliTest):
+
+    def test_schema_outline(self):
+        stdout, _ = self.run_and_expect_success([
+            "custodian", "schema", "--outline", "--json", "aws"])
+        data = json.loads(stdout)
+        self.assertEqual(list(data.keys()), ["aws"])
+        self.assertTrue(len(data['aws']) > 100)
+        self.assertEqual(
+            sorted(data['aws']['aws.ec2'].keys()), ['actions', 'filters'])
+        self.assertTrue(len(data['aws']['aws.ec2']['actions']) > 10)
+
+    def test_schema_alias(self):
+        stdout, _ = self.run_and_expect_success([
+            "custodian", "schema", "aws.network-addr"])
+        self.assertIn("aws.elastic-ip:", stdout)
+
+    def test_schema_alias_unqualified(self):
+        stdout, _ = self.run_and_expect_success([
+            "custodian", "schema", "network-addr"])
+        self.assertIn("aws.elastic-ip:", stdout)
 
     def test_schema(self):
 
         # no options
-        self.run_and_expect_success(["custodian", "schema"])
+        stdout, _ = self.run_and_expect_success(["custodian", "schema"])
+        data = yaml_load(stdout)
+        assert data['resources']
 
         # summary option
         self.run_and_expect_success(["custodian", "schema", "--summary"])
@@ -172,8 +232,17 @@ class SchemaTest(CliTest):
         # json option
         self.run_and_expect_success(["custodian", "schema", "--json"])
 
+        # with just a cloud
+        self.run_and_expect_success(["custodian", "schema", "aws"])
+
         # with just a resource
         self.run_and_expect_success(["custodian", "schema", "ec2"])
+
+        # with just a mode
+        self.run_and_expect_success(["custodian", "schema", "mode"])
+
+        # mode.type
+        self.run_and_expect_success(["custodian", "schema", "mode.phd"])
 
         # resource.actions
         self.run_and_expect_success(["custodian", "schema", "ec2.actions"])
@@ -203,7 +272,18 @@ class SchemaTest(CliTest):
     def test_schema_output(self):
 
         output = self.get_output(["custodian", "schema"])
-        self.assertIn("ec2", output)
+        self.assertIn("aws.ec2", output)
+        # self.assertIn("azure.vm", output)
+        # self.assertIn("gcp.instance", output)
+
+        output = self.get_output(["custodian", "schema", "aws"])
+        self.assertIn("aws.ec2", output)
+        self.assertNotIn("azure.vm", output)
+        self.assertNotIn("gcp.instance", output)
+
+        output = self.get_output(["custodian", "schema", "aws.ec2"])
+        self.assertIn("actions:", output)
+        self.assertIn("filters:", output)
 
         output = self.get_output(["custodian", "schema", "ec2"])
         self.assertIn("actions:", output)
@@ -215,6 +295,75 @@ class SchemaTest(CliTest):
 
         output = self.get_output(["custodian", "schema", "ec2.filters.image"])
         self.assertIn("Help", output)
+
+    def test_schema_expand(self):
+        # refs should only ever exist in a dictionary by itself
+        test_schema = {
+            '$ref': '#/definitions/filters_common/value_from'
+        }
+        result = ElementSchema.schema(generate()['definitions'], test_schema)
+        self.assertEqual(result, ValuesFrom.schema)
+
+    def test_schema_multi_expand(self):
+        test_schema = {
+            'schema1': {
+                '$ref': '#/definitions/filters_common/value_from'
+            },
+            'schema2': {
+                '$ref': '#/definitions/filters_common/value_from'
+            }
+        }
+
+        expected = yaml_dump({
+            'schema1': {
+                'type': 'object',
+                'additionalProperties': 'False',
+                'required': ['url'],
+                'properties': {
+                    'url': {'type': 'string'},
+                    'query': {'type': 'string'},
+                    'format': {'enum': ['csv', 'json', 'txt', 'csv2dict']},
+                    'expr': {'oneOf': [
+                        {'type': 'integer'},
+                        {'type': 'string'}]},
+                    'headers': {
+                        'type': 'object',
+                        'patternProperties': {
+                            '': {'type': 'string'},
+                        },
+                    },
+                }
+            },
+            'schema2': {
+                'type': 'object',
+                'additionalProperties': 'False',
+                'required': ['url'],
+                'properties': {
+                    'url': {'type': 'string'},
+                    'query': {'type': 'string'},
+                    'format': {'enum': ['csv', 'json', 'txt', 'csv2dict']},
+                    'expr': {'oneOf': [
+                        {'type': 'integer'},
+                        {'type': 'string'}]},
+                    'headers': {
+                        'type': 'object',
+                        'patternProperties': {
+                            '': {'type': 'string'},
+                        },
+                    },
+                }
+            }
+        })
+
+        result = yaml_dump(ElementSchema.schema(generate()['definitions'], test_schema))
+        self.assertEqual(result, expected)
+
+    def test_schema_expand_not_found(self):
+        test_schema = {
+            '$ref': '#/definitions/filters_common/invalid_schema'
+        }
+        result = ElementSchema.schema(generate()['definitions'], test_schema)
+        self.assertEqual(result, None)
 
 
 class ReportTest(CliTest):
@@ -252,6 +401,12 @@ class ReportTest(CliTest):
         )
         self.assertIn("InstanceId", output)
         self.assertIn("i-014296505597bf519", output)
+
+        # json format
+        output = self.get_output(
+            ["custodian", "report", "--format", "json", "-s", self.output_dir, yaml_file]
+        )
+        self.assertTrue("i-014296505597bf519", json.loads(output)[0]['InstanceId'])
 
         # empty file
         temp_dir = self.get_temp_dir()
@@ -334,31 +489,7 @@ class LogsTest(CliTest):
         }
         yaml_file = self.write_policy_file({"policies": [p_data]})
         output_dir = os.path.join(os.path.dirname(__file__), "data", "logs")
-        self.run_and_expect_success(["custodian", "logs", "-s", output_dir, yaml_file])
-
-
-class TabCompletionTest(CliTest):
-    """ Tests for argcomplete tab completion. """
-
-    def test_schema_completer(self):
-        self.assertIn("aws.rds", cli.schema_completer("rd"))
-        self.assertIn("aws.s3.", cli.schema_completer("s3"))
-        self.assertListEqual([], cli.schema_completer("invalidResource."))
-        self.assertIn("aws.rds.actions", cli.schema_completer("rds."))
-        self.assertIn("aws.s3.filters.", cli.schema_completer("s3.filters"))
-        self.assertIn("aws.s3.filters.event", cli.schema_completer("s3.filters.eve"))
-        self.assertListEqual([], cli.schema_completer("rds.actions.foo.bar"))
-
-    def test_schema_completer_wrapper(self):
-
-        class MockArgs(object):
-            summary = False
-
-        args = MockArgs()
-        self.assertIn("aws.rds", cli._schema_tab_completer("rd", args))
-
-        args.summary = True
-        self.assertListEqual([], cli._schema_tab_completer("rd", args))
+        self.run_and_expect_failure(["custodian", "logs", "-s", output_dir, yaml_file], 1)
 
 
 class RunTest(CliTest):
@@ -460,6 +591,29 @@ class RunTest(CliTest):
             ["custodian", "run", "-s", temp_dir, "--debug", yaml_file], CustomError
         )
 
+    def test_session_policy(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--session-policy', action=LoadSessionPolicyJson)
+        bad_session_policy = "bad_policy"
+        sample_policy = {
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "Statement1",
+                "Effect": "Allow",
+                "Action": ["lambda:ListFunctions", "tag:*", "ebs:Delete*"],
+                "Resource": "*"
+                }]
+            }
+        session_policy = self.write_policy_file(sample_policy, format="json")
+        arguments = parser.parse_args(["--session-policy", session_policy])
+        self.assertEqual(vars(arguments).get('session_policy'), sample_policy)
+        self.assertEqual(LoadSessionPolicyJson(dest=session_policy,
+            option_strings=None).load_session_policy_from_file(session_policy), sample_policy)
+        with self.assertRaises(FileNotFoundError) as e:
+            LoadSessionPolicyJson(dest=session_policy,
+                option_strings=None).load_session_policy_from_file(bad_session_policy)
+        self.assertIn("No such file or directory", str(e.exception))
+
 
 class MetricsTest(CliTest):
 
@@ -498,8 +652,7 @@ class MetricsTest(CliTest):
         end = datetime.utcnow()
         start = end - timedelta(14)
         period = 24 * 60 * 60 * 14
-
-        out = self.get_output(
+        self.run_and_expect_failure(
             [
                 "custodian",
                 "metrics",
@@ -510,45 +663,8 @@ class MetricsTest(CliTest):
                 "--period",
                 str(period),
                 yaml_file,
-            ]
-        )
-
-        self.assertEqual(
-            json.loads(out),
-            {
-                "ec2-tag-compliance-v6": {
-                    u"Durations": [],
-                    u"Errors": [
-                        {
-                            u"Sum": 0.0,
-                            u"Timestamp": u"2016-05-30T10:50:00+00:00",
-                            u"Unit": u"Count",
-                        }
-                    ],
-                    u"Invocations": [
-                        {
-                            u"Sum": 4.0,
-                            u"Timestamp": u"2016-05-30T10:50:00+00:00",
-                            u"Unit": u"Count",
-                        }
-                    ],
-                    u"ResourceCount": [
-                        {
-                            u"Average": 1.0,
-                            u"Sum": 2.0,
-                            u"Timestamp": u"2016-05-30T10:50:00+00:00",
-                            u"Unit": u"Count",
-                        }
-                    ],
-                    u"Throttles": [
-                        {
-                            u"Sum": 0.0,
-                            u"Timestamp": u"2016-05-30T10:50:00+00:00",
-                            u"Unit": u"Count",
-                        }
-                    ],
-                }
-            },
+            ],
+            1
         )
 
     def test_metrics_get_endpoints(self):
@@ -556,7 +672,7 @@ class MetricsTest(CliTest):
         #
         # Test for defaults when --start is not supplied
         #
-        class FakeOptions(object):
+        class FakeOptions:
             start = end = None
             days = 5
 
@@ -586,7 +702,7 @@ class MetricsTest(CliTest):
 class MiscTest(CliTest):
 
     def test_no_args(self):
-        stdout, stderr = self.run_and_expect_failure(["custodian"], 2)
+        _, stderr = self.run_and_expect_failure(["custodian"], 2)
         self.assertIn("metrics", stderr)
         self.assertIn("logs", stderr)
 
@@ -594,7 +710,8 @@ class MiscTest(CliTest):
         # Doesn't do anything, but should exit 0
         temp_dir = self.get_temp_dir()
         yaml_file = self.write_policy_file({})
-        self.run_and_expect_success(["custodian", "run", "-s", temp_dir, yaml_file])
+        self.run_and_expect_failure(
+            ["custodian", "run", "-s", temp_dir, yaml_file], 1)
 
     def test_nonexistent_policy_file(self):
         temp_dir = self.get_temp_dir()
